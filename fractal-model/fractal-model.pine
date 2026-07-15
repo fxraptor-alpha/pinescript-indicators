@@ -1,7 +1,7 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // Copyright and attribution notices are governed by the license in this repository.
 //@version=6
-indicator('Fractal with PS', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+indicator('Fractal Model', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
 
 // ============================================================================
 // Types - Data Only (no drawing objects stored)

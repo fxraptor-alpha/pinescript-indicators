@@ -1,6 +1,6 @@
-# Fractal with PS
+# Fractal Model
 
-`Fractal with PS` is a TradingView Pine Script indicator that projects higher-timeframe candle structure onto the active chart and tracks sweep-based setups. It combines HTF candle visualization, liquidity sweep detection, C2 confirmation, CISD levels, optional standard-deviation projections, formation liquidity lines, alerts, and a position-sizer overlay.
+`Fractal Model` is a TradingView Pine Script indicator that projects higher-timeframe candle structure onto the active chart and tracks sweep-based setups. It combines HTF candle visualization, liquidity sweep detection, C2 confirmation, CISD levels, optional standard-deviation projections, formation liquidity lines, alerts, and a position-sizer overlay.
 
 ## High-Level Purpose
 
@@ -76,10 +76,21 @@ The script draws risk and reward boxes so the setup can be assessed visually.
 
 1. Open TradingView.
 2. Create a new Pine Script indicator.
-3. Paste the contents of `indicators/fractal-with-ps/fractal-with-ps.pine`.
+3. Paste the contents of `fractal-model.pine`.
 4. Add it to a chart.
 5. Start with `Fractal = Automatic`, `Bias = Neutral`, and projections disabled.
 6. Enable projections and the position sizer only after confirming that sweep and CISD markings match your intended model.
+
+## Chart Images
+
+Put TradingView screenshots in images/ and include them near the relevant explanation in this file. Good first examples are:
+
+- automatic-fractal.png: the higher-timeframe candle projection on a chart.
+- bullish-sweep-cisd.png: a bullish sweep through confirmation.
+- bearish-sweep-cisd.png: a bearish sweep through confirmation.
+- position-sizer.png: entry, stop, and target boxes.
+
+For each image, remove account names, open orders, account balances, and any other personal information before uploading.
 
 ## Attribution Notes
 

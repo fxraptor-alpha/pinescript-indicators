@@ -1,14 +1,14 @@
 # Pine Script Indicators
 
-This repository collects Pine Script indicators, notes, and implementation explanations.
+This repository collects Pine Script indicators, chart examples, and implementation explanations.
 
-The first indicator is **Fractal with PS**, a multi-timeframe market-structure tool for TradingView. It is inspired by publicly available trading education concepts, including videos by TTrades. This project is not affiliated with or endorsed by TTrades, but this repository documents this implementation as its own maintained codebase.
+The first indicator is **Fractal Model**, a multi-timeframe market-structure tool for TradingView. It is inspired by publicly available trading education concepts, including videos by TTrades. This project is not affiliated with or endorsed by TTrades.
 
 ## Indicators
 
 | Indicator | Script | Explanation |
 | --- | --- | --- |
-| Fractal with PS | [`indicators/fractal-with-ps/fractal-with-ps.pine`](indicators/fractal-with-ps/fractal-with-ps.pine) | [`docs/fractal-with-ps.md`](docs/fractal-with-ps.md) |
+| Fractal Model | [`fractal-model/fractal-model.pine`](fractal-model/fractal-model.pine) | [`fractal-model/README.md`](fractal-model/README.md) |
 
 ## GitHub Terms In Simple Words
 
@@ -20,7 +20,7 @@ The first indicator is **Fractal with PS**, a multi-timeframe market-structure t
 
 ## Attribution And License
 
-The current `Fractal with PS` source file includes the applicable license notice. Personal author details are intentionally omitted from this public project.
+The current `Fractal Model` source file includes the applicable license notice. Personal author details are intentionally omitted from this public project.
 
 The indicator logic is documented here for educational and research use. If future versions include code copied or modified from another author, keep the original notices, document the changes, and follow that source's license.
 
