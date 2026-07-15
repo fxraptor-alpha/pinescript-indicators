@@ -1,108 +1,90 @@
 # Fractal Model
 
-`Fractal Model` is a TradingView Pine Script indicator that projects higher-timeframe candle structure onto the active chart and tracks sweep-based setups. It combines HTF candle visualization, liquidity sweep detection, C2 confirmation, CISD levels, optional standard-deviation projections, formation liquidity lines, alerts, and a position-sizer overlay.
+`Fractal Model` is a TradingView tool for marking a multi-timeframe reversal sequence. It projects selected higher-timeframe candles beside the active chart, watches their highs and lows for a sweep, then maps the confirmation and target levels that follow.
 
-## High-Level Purpose
+It is a visual-analysis tool. It does not place orders or guarantee a trade outcome.
 
-The indicator helps a trader observe when the current lower-timeframe price action interacts with a previous higher-timeframe candle's high or low. When price wicks beyond a prior HTF extreme and closes back inside that level, the script treats that as a potential sweep. From there, it tracks whether the setup confirms, finds a CISD level, draws the relevant levels, and optionally shows risk/reward boxes.
+## The Model In One View
 
-## Main Concepts
+The script looks for this sequence:
 
-### HTF Candle Projection
+```text
+Higher-timeframe level -> sweep -> close back through the level -> C2 -> CISD -> projections / trade plan
+```
 
-The script builds an internal array of higher-timeframe candles. Each candle stores open, high, low, close, bar indexes, open time, close time, and display positions. On the last chart bar, those candles are drawn to the right side of the chart as a compact HTF projection.
+The higher-timeframe high or low is the reference point. A sweep alone is not enough: the candle must close back through the swept level to create a reversal candidate. The script labels that candidate `C2`, then waits for a lower-timeframe change in delivery (`CISD`) before treating the setup as confirmed.
 
-Supported fractal modes include:
+## Bullish Sequence
 
-- Automatic timeframe mapping, such as `1m -> 15m`, `5m -> 1H`, `1H -> 1D`.
-- Custom lower/higher timeframe selection.
-- Quarterly/session modes based on 22.5-minute, 90-minute, and 6-hour session cycles.
+1. Price trades below a prior higher-timeframe low.
+2. The active candle closes back above that low.
+3. The script identifies the reversal candle as a bullish `C2` candidate.
+4. A later close above the calculated CISD level confirms the move.
+5. Optional liquidity lines, projection levels, and position-sizing boxes help frame the next upside objective.
 
-### Sweep Detection
+## Bearish Sequence
 
-A bearish sweep starts when price trades above a previous HTF high. It confirms when price closes back below that swept high.
+1. Price trades above a prior higher-timeframe high.
+2. The active candle closes back below that high.
+3. The script identifies the reversal candle as a bearish `C2` candidate.
+4. A later close below the calculated CISD level confirms the move.
+5. Optional liquidity lines, projection levels, and position-sizing boxes help frame the next downside objective.
 
-A bullish sweep starts when price trades below a previous HTF low. It confirms when price closes back above that swept low.
+## What The Script Draws
 
-The script tracks both live setups and completed historical setups. It can also filter setups by bias: neutral, bullish only, or bearish only.
+### Higher-Timeframe Candle Projection
 
-### C2 And CISD Logic
+The panel on the right of the chart is a compact view of higher-timeframe candles. It gives the sweep logic a visible reference without requiring a separate chart window.
 
-The script labels the sweep candle as `C2` after the setup confirms. It then searches backward from the setup extreme to find a CISD level:
+### Sweep And C2 Marking
 
-- Bearish setup: CISD is triggered when price closes below the tracked CISD level.
-- Bullish setup: CISD is triggered when price closes above the tracked CISD level.
+When price sweeps a projected high or low and returns through it on close, the script marks the sweep and tracks the corresponding C2. A setup that later breaks its invalidation point can be marked as `xC2`.
 
-If price invalidates the setup after CISD, the label can be shown as `xC2`.
+### CISD Level
+
+The CISD line is the script's confirmation level. It is derived from the candles around the setup and acts as the boundary price must close through before the script considers the reversal confirmed.
 
 ### Projection Levels
 
-When projections are enabled, the script draws standard-deviation levels from the setup range. The default levels are:
+After confirmation, the script can draw range-based projection levels from the setup. The default values are `0`, `1`, `-1`, `-2`, and `-2.5`. Treat these as charting reference levels, not predicted prices.
 
-```text
-0,1,-1,-2,-2.5
-```
+### Formation Liquidity And Position Sizer
 
-The projection can be based on wick extremes or candle bodies.
+The optional formation-liquidity lines mark selected C1/C0 levels. The position sizer uses the CISD, C2 extreme, and configured risk/reward ratio to draw a visual entry, stop, and target plan.
 
-### Formation Liquidity
+## Settings To Start With
 
-The script can draw liquidity levels from the C1 and optional C0 candles. It tracks whether those levels are later mitigated by price crossing them.
+| Setting | Suggested starting point | What it changes |
+| --- | --- | --- |
+| `Fractal` | `Automatic` | Selects the higher-timeframe relationship. |
+| `Bias` | `Neutral` | Shows bullish and bearish setups. |
+| `Show Sweeps` | On | Shows sweep lines and live setup tracking. |
+| `Show CISD` | On | Shows the confirmation level. |
+| `Enable Projections` | Off at first | Adds range-based target references after confirmation. |
+| `Enable Position Sizer` | Off at first | Adds visual entry, risk, and reward boxes. |
+| `Calculate on Close` | On | Uses confirmed candles and can reduce live-chart workload. |
 
-### Position Sizer
+## Using It In TradingView
 
-When enabled, the position sizer uses:
+1. Open the [Pine Script source](fractal-model.pine) and copy it into a new TradingView Pine editor script.
+2. Add the script to a chart.
+3. Begin with automatic fractal selection and neutral bias.
+4. Review a completed sweep and C2 before enabling projections or position sizing.
+5. Test the model across symbols and timeframes before relying on it in a trading workflow.
 
-- Entry: CISD level.
-- Stop: C2 extreme.
-- Target: calculated from the configured risk/reward ratio.
+## Chart Examples
 
-The script draws risk and reward boxes so the setup can be assessed visually.
+Add original, anonymized screenshots to `images/` and embed them here as the library grows. Useful first examples:
 
-## Important Inputs
+- `bullish-sequence.png`: sweep below a higher-timeframe low, C2, and CISD confirmation.
+- `bearish-sequence.png`: sweep above a higher-timeframe high, C2, and CISD confirmation.
+- `projections.png`: projection levels after a confirmed setup.
+- `position-sizer.png`: entry, stop, and target boxes.
 
-| Setting | Purpose |
-| --- | --- |
-| `Fractal` | Chooses automatic, quarterly, custom, or fixed timeframe mapping. |
-| `Bias` | Filters bullish, bearish, or both setup directions. |
-| `Show Sweeps` | Draws sweep lines and controls live setup visibility. |
-| `Show CISD` | Draws CISD confirmation levels. |
-| `Enable Projections` | Draws deviation projection levels after CISD. |
-| `Enable Formation Liquidity` | Draws C1/C0 liquidity levels. |
-| `Enable Position Sizer` | Draws risk/reward boxes from entry, stop, and target. |
-| `Calculate on Close` | Limits live setup calculation to confirmed lower-timeframe candles for better performance. |
+Remove account names, orders, balances, personal annotations, and other identifying details before uploading an image.
 
-## Suggested TradingView Use
+## Scope And Attribution
 
-1. Open TradingView.
-2. Create a new Pine Script indicator.
-3. Paste the contents of `fractal-model.pine`.
-4. Add it to a chart.
-5. Start with `Fractal = Automatic`, `Bias = Neutral`, and projections disabled.
-6. Enable projections and the position sizer only after confirming that sweep and CISD markings match your intended model.
+This independent implementation was informed by publicly available trading education, including material published by TTrades. It is not affiliated with, endorsed by, or presented as the official TTrades Fractal Model. The explanation here describes this script's behavior in original language and does not reproduce third-party charts or course material.
 
-## Chart Images
-
-Put TradingView screenshots in images/ and include them near the relevant explanation in this file. Good first examples are:
-
-- automatic-fractal.png: the higher-timeframe candle projection on a chart.
-- bullish-sweep-cisd.png: a bullish sweep through confirmation.
-- bearish-sweep-cisd.png: a bearish sweep through confirmation.
-- position-sizer.png: entry, stop, and target boxes.
-
-For each image, remove account names, open orders, account balances, and any other personal information before uploading.
-
-## Attribution Notes
-
-This implementation is inspired by public trading education concepts, including videos by TTrades. This project is not affiliated with or endorsed by TTrades. Personal author details are intentionally omitted from this public project.
-
-Ideas, concepts, trading methods, and educational frameworks are different from copied source code, though this is not legal advice. To reduce attribution and licensing risk, keep third-party notices in copied or modified code, avoid copying video text or proprietary descriptions verbatim, and document what changed in future commits.
-
-## Limitations
-
-- Pine Script behavior should be verified directly in TradingView after each code change.
-- Placeholder inputs such as `Previous EQ` and `Drawings Type` are present but marked as not yet implemented in the code.
-- This indicator is a visual analysis tool, not a complete trading system.
-- No indicator guarantees profitable trades.
-
-
+The source includes an MPL 2.0 notice. This repository is for education and research, not financial or legal advice.
