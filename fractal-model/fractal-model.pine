@@ -1454,7 +1454,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
             Candle delCandle = array.pop(candleSet.candles)
             // Clean up sweeps associated with the deleted candle
             if candleSet.sweeps.size() > 0
-                for i = candleSet.sweeps.size() - 1 to 0 by 1
+                for i = candleSet.sweeps.size() - 1 to 0 by -1
                     Sweep sweep = candleSet.sweeps.get(i)
                     if sweep.swept_candle_idx == delCandle.o_idx
                         candleSet.sweeps.remove(i)
