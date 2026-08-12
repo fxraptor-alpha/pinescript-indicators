@@ -1,6 +1,6 @@
 //@version=6
 import fstarcapital/AssetCorrelationUtils/12 as ACL
-indicator('Fractal Model July 31', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+indicator('Fractal Model', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
 
 // ============================================================================
 // Types - Data Only (no drawing objects stored)
