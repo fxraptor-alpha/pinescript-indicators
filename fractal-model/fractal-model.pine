@@ -1,7 +1,6 @@
-// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// Copyright (c) 2026 fxraptor-alpha. Attribution notices are governed by the license in this repository.
 //@version=6
-indicator('Fractal Model', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+import fstarcapital/AssetCorrelationUtils/12 as ACL
+indicator('Fractal Model July 31', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
 
 // ============================================================================
 // Types - Data Only (no drawing objects stored)
@@ -37,6 +36,14 @@ type Sweep
     int ltf_end_idx
     bool is_high  // true = high sweep, false = low sweep
 
+// Completed IC-CISD (confirmed only)
+type ICCisd
+    float level
+    int start_idx
+    int end_idx
+    float extreme_price
+    int extreme_idx
+
 type Setup
     bool is_bullish          // true = bullish setup (low sweep), false = bearish (high sweep)
     bool is_confirmed        // true when sweep is confirmed (close in range)
@@ -61,6 +68,16 @@ type Setup
     int extreme_bar_idx      // bar index where the extreme occurred (for CISD traceback)
     bool has_cisd            // true when CISD level is set
     bool cisd_triggered      // true when close crosses through CISD level
+    // IC-CISD (rebuild): opposite-candle open = level; body break confirms; one pending
+    array<ICCisd> ic_list
+    bool ic_active           // detection on after main CISD (through C4)
+    bool ic_pending          // waiting for body break on current structure
+    float ic_level           // open of opposite candle
+    int ic_start_idx         // bar of that opposite candle
+    float ic_extreme         // running high (bear) / low (bull) for dot — update every bar until confirm
+    int ic_extreme_idx
+    bool ic_seen_same_side   // true only after a real same-side candle (not doji) while pending
+    float ic_last_extreme    // last confirmed IC swing extreme — next arm only if exceeds this (higher high / lower low)
     // Projection data
     float proj_anchor_1      // Point "1" - swing high (bearish) or swing low (bullish)
     float proj_anchor_0      // Point "0" - CISD candle's low (bearish) or high (bullish)
@@ -76,14 +93,32 @@ type Setup
     int liq_c0_mitigated_idx // Bar index where C0 liq was crossed (na if not mitigated)
     // Invalidation
     bool is_invalid          // True if C3 exceeded C2 extreme after CISD triggered
-    // Position Sizer data
-    float ps_entry           // Entry price (CISD level)
-    float ps_stop            // Stop loss price (C2 extreme)
-    float ps_target          // Take profit price (calculated from R:R)
-    int ps_start_idx         // Bar index where position sizer starts
-    int ps_end_time          // Time when PS boxes should stop extending
-    bool ps_hit_target       // True when target is reached
-    bool ps_hit_stop         // True when stop is hit
+    // Entry Zone C3 data
+    float c2_mid             // C2 wick midpoint (high+low)/2
+    float c3_open            // C3 open price
+    bool ez_c3_set           // true when C3 entry zone bounds are calculated
+    float ez_c3_top          // C3 zone top price
+    float ez_c3_bot          // C3 zone bottom price
+    int ez_c3_left_time      // C3 zone left (C3 open time)
+    int ez_c3_right_time     // C3 zone right (C3 close / C4 open); na while C3 is live
+    // Entry Zone C4 data
+    float c3_mid             // C3 wick midpoint (high+low)/2
+    float c3_extreme         // C3 high (bearish) or low (bullish) for C4 invalidation
+    float c4_open            // C4 open price
+    bool ez_c4_set           // true when C4 entry zone bounds are calculated
+    bool ez_c4_invalid       // true when C4 invalidated (beyond C3 extreme)
+    int ez_c4_invalid_time   // LTF time where C4 was invalidated (EQ stops here)
+    float ez_c4_top          // C4 zone top price
+    float ez_c4_bot          // C4 zone bottom price
+    int ez_c4_left_time      // C4 zone left (C4 open time)
+    int ez_c4_right_time     // C4 zone right (C4 close)
+    // SMT data
+    bool has_smt             // SMT detected for this setup
+    int smt_x1               // SMT line start bar index
+    int smt_x2               // SMT line end bar index
+    float smt_y1             // SMT line start price
+    float smt_y2             // SMT line end price
+    string smt_symbol        // Which symbol triggered SMT (for label)
 
 type CandleSettings
     string htf
@@ -141,6 +176,11 @@ type Settings
     color cisd_bear_color
     int cisd_width
     string cisd_style
+    bool ic_cisd_show        // IC-CISD toggle (same colors/width/style as CISD)
+    // Entry Zone settings
+    bool entry_zone_show
+    color entry_zone_bull_color
+    color entry_zone_bear_color
     // General settings
     bool alerts_enabled
     bool live_alerts_enabled
@@ -162,11 +202,6 @@ type Settings
     color liq_color
     string liq_style
     int liq_width
-    // Position Sizer settings
-    bool ps_show
-    float ps_rr
-    color ps_risk_color
-    color ps_reward_color
 
 
 
@@ -186,6 +221,17 @@ type DrawingBin
     array<line> lines
     array<box> boxes
     array<label> labels
+
+// Tracks running high/low for SMT comparison symbols
+type SMT_Tracker
+    float h              // Running high of current HTF candle
+    float l              // Running low
+    int h_idx            // Bar index where high occurred
+    int l_idx            // Bar index where low occurred
+    float prev_h         // Previous HTF candle high
+    float prev_l         // Previous HTF candle low
+    int prev_h_idx       // Previous high bar index
+    int prev_l_idx       // Previous low bar index
 
 // ============================================================================
 // Global Variables
@@ -237,6 +283,8 @@ settings.bias                   := input.string('Neutral', 'Bias', options=['Neu
 
 getHigherTF() =>
     switch timeframe.period
+        "1S" => "1"    // 1 second → 1 minute
+        "15S" => "5"   // 15 seconds → 5 minutes
         "1" => "15"
         "3" => "30"
         "5" => "60"
@@ -521,12 +569,12 @@ htf.settings.hl_show           := hl_show_input
 htf.settings.hl_color          := input.color(color.rgb(0,0,0,70), '', inline='lh', group = group_htf, active = hl_show_input)
 htf.settings.hl_style          := input.string('Dotted', '', options=['Solid','Dashed','Dotted'], inline='lh', group = group_htf, active = hl_show_input)
 htf.settings.hl_width          := input.int(1, 'Width', options=[1,2,3,4], inline='lh', group = group_htf, active = hl_show_input)
-// Placeholder inputs (not yet wired)
-prev_eq_show                   = input.bool(false, 'Previous EQ   ', inline='prev_eq', group = group_htf)
-prev_eq_color                  = input.color(color.rgb(0,0,0,70), '', inline='prev_eq', group = group_htf, active = prev_eq_show)
+// Previous EQ — chart lines when On Chart or Both; HTF candle projection later when HTF candle or Both
+prev_eq_show                   = input.bool(true, 'Previous EQ   ', inline='prev_eq', group = group_htf)
+prev_eq_color                  = input.color(color.rgb(0,0,0,0), '', inline='prev_eq', group = group_htf, active = prev_eq_show)
 prev_eq_style                  = input.string('Dotted', '', options=['Solid','Dashed','Dotted'], inline='prev_eq', group = group_htf, active = prev_eq_show)
 prev_eq_width                  = input.int(1, 'Width', options=[1,2,3,4], inline='prev_eq', group = group_htf, active = prev_eq_show)
-drawings_type                  = input.string('Both', 'Drawings Type', options=['Both', 'Lines', 'Boxes'], group = group_htf, tooltip='Controls how HTF candles and elements are drawn. (Not yet implemented)',active = prev_eq_show)
+drawings_type                  = input.string('Both', 'Drawings Type', options=['Both', 'On Chart', 'HTF candle'], group = group_htf, tooltip='On Chart: EQ lines on price chart (setup package).\nHTF candle: EQ on HTF projection (later).\nBoth: chart + projection.', active = prev_eq_show)
 
 sweep_show_input                = input.bool(true, 'Show Sweeps   ', group=group_sweep, inline='sweep')
 settings.sweep_show             := sweep_show_input
@@ -539,10 +587,16 @@ settings.c2_color               := input.color(color.rgb(0, 0, 0), 'C2 Label    
 settings.c2_size                := input.string(size.small, '', options=[size.tiny, size.small, size.normal, size.large], inline='c2', group=group_sweep)
 cisd_show_input                 = input.bool(true, 'Show CISD     ', inline='cisd', group=group_sweep)
 settings.cisd_show              := cisd_show_input
-settings.cisd_bull_color        := input.color(color.rgb(41,98,255), 'Bull          ', inline='cisd_color', group=group_sweep, active = cisd_show_input)
-settings.cisd_bear_color        := input.color(color.rgb(242,54,69), 'Bear', inline='cisd_color', group=group_sweep, active = cisd_show_input)
-settings.cisd_width             := input.int(2, 'Width', options=[1, 2, 3, 4], inline='cisd_style', group=group_sweep, active = cisd_show_input)
-settings.cisd_style             := input.string('Solid', 'Style', options=['Solid', 'Dashed', 'Dotted'], inline='cisd_style', group=group_sweep, active = cisd_show_input)
+ic_cisd_show_input              = input.bool(false, 'IC-CISD', inline='cisd', group=group_sweep, tooltip='Same-side IC-CISD after main CISD confirm through C4 (stops on setup or C4 invalid). Uses CISD colors/width/style. Extreme marked with a dot.')
+settings.ic_cisd_show           := ic_cisd_show_input
+settings.cisd_bull_color        := input.color(color.rgb(41,98,255), 'Bull          ', inline='cisd_color', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
+settings.cisd_bear_color        := input.color(color.rgb(242,54,69), 'Bear', inline='cisd_color', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
+settings.cisd_width             := input.int(2, 'Width', options=[1, 2, 3, 4], inline='cisd_style', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
+settings.cisd_style             := input.string('Solid', 'Style', options=['Solid', 'Dashed', 'Dotted'], inline='cisd_style', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
+entry_zone_show_input           = input.bool(true, 'Entry Zone   ', inline='entry_zone', group=group_sweep)
+settings.entry_zone_show        := entry_zone_show_input
+settings.entry_zone_bull_color  := input.color(color.new(color.rgb(41, 98, 255), 85), 'Bullish', inline='entry_zone', group=group_sweep, active = entry_zone_show_input)
+settings.entry_zone_bear_color  := input.color(color.new(color.rgb(242, 54, 69), 85), 'Bearish', inline='entry_zone', group=group_sweep, active = entry_zone_show_input)
 
 // Standard Deviation Projections
 string group_projection         = "Standard Deviation Projections  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -573,13 +627,44 @@ settings.liq_color              := input.color(color.rgb(0, 0, 0), '', inline='l
 settings.liq_style              := input.string('Dotted', '', options=['Solid', 'Dashed', 'Dotted'], inline='liq_style', group=group_liquidity, active = liq_show_input)
 settings.liq_width              := input.int(1, 'Width', inline='liq_style', group=group_liquidity, active = liq_show_input)
 
-// Position Sizer
-string group_position_sizer     = "Position Sizer  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-pos_sizer_show_input            = input.bool(true, 'Enable Position Sizer?', group=group_position_sizer)
-settings.ps_show                := pos_sizer_show_input
-settings.ps_rr                  := input.float(2.0, 'Risk:Reward    ', minval=0.5, step=0.5, group=group_position_sizer, tooltip='Take profit distance as multiple of stop loss distance', active=pos_sizer_show_input)
-settings.ps_risk_color          := input.color(color.new(#787b86, 80), 'Risk Box      ', inline='sizer_colors', group=group_position_sizer, active=pos_sizer_show_input)
-settings.ps_reward_color        := input.color(color.new(#5b9cf6, 80), 'Reward', inline='sizer_colors', group=group_position_sizer, active=pos_sizer_show_input)
+// SMT Divergence
+string group_smt                = "SMT Divergence  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+smt_show_input                  = input.bool(true, 'Enable SMT?', inline='smt_enable', group=group_smt)
+smt_alerts_input                = input.bool(true, 'Alerts?', inline='smt_enable', group=group_smt)
+smt_label_show_input            = input.bool(true, 'Labels?', inline='smt_labels', group=group_smt, active = smt_show_input)
+smt_label_size_input            = input.string('Small', '', options=['Tiny', 'Small', 'Normal', 'Large'], inline='smt_labels', group=group_smt, active = smt_show_input and smt_label_show_input)
+smt_line_style_input            = input.string('Solid', '', options=['Solid', 'Dashed', 'Dotted'], inline='smt_style', group=group_smt, active = smt_show_input)
+smt_line_width_input            = input.int(1, 'Width', options=[1, 2, 3, 4], inline='smt_style', group=group_smt, active = smt_show_input)
+smt_color_input                 = input.color(color.rgb(156, 39, 176), '', inline='smt_color', group=group_smt, active = smt_show_input)
+smt_mode_input                  = input.string('Automatic', 'SMT Mode', options=['Automatic', 'Manual'], inline='smt_mode', group=group_smt, active = smt_show_input)
+smt_sym2_enable_input           = input.bool(true, 'Enable Second SMT?', inline='smt_mode', group=group_smt, active = smt_show_input)
+// Symbol 1
+smt_sym1_manual_input           = input.symbol('CME_MINI:ES1!', '1.', inline='smt_sym1', group=group_smt, active = smt_show_input and smt_mode_input == 'Manual')
+smt_sym1_inverse_input          = input.bool(false, 'Inverse ?', inline='smt_sym1', group=group_smt, active = smt_show_input and smt_mode_input == 'Manual')
+// Symbol 2
+smt_sym2_manual_input           = input.symbol('CME_MINI:NQ1!', '2.', inline='smt_sym2', group=group_smt, active = smt_show_input and smt_mode_input == 'Manual' and smt_sym2_enable_input)
+smt_sym2_inverse_input          = input.bool(false, 'Inverse ?', inline='smt_sym2', group=group_smt, active = smt_show_input and smt_mode_input == 'Manual' and smt_sym2_enable_input)
+
+// SMT Symbol Resolution using library
+acl_config                      = ACL.resolveCurrentChart()
+smt_sym1_resolved               = smt_mode_input == 'Automatic' ? acl_config.secondary : smt_sym1_manual_input
+smt_sym2_resolved               = smt_mode_input == 'Automatic' ? acl_config.tertiary : smt_sym2_manual_input
+smt_sym1_inverse                = smt_mode_input == 'Automatic' ? acl_config.invertSecondary : smt_sym1_inverse_input
+smt_sym2_inverse                = smt_mode_input == 'Automatic' ? acl_config.invertTertiary : smt_sym2_inverse_input
+
+// SMT Data Fetching - get comparison symbol high/low on current timeframe
+[smt_sym1_h, smt_sym1_l] = request.security(smt_sym1_resolved, "", [high, low], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+[smt_sym2_h, smt_sym2_l] = request.security(smt_sym2_resolved, "", [high, low], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+// SMT Tracker Variables (track running H/L for comparison symbols)
+var SMT_Tracker smt_tracker1 = SMT_Tracker.new()
+var SMT_Tracker smt_tracker2 = SMT_Tracker.new()
+// Also track current symbol for SMT line drawing
+var SMT_Tracker smt_tracker_curr = SMT_Tracker.new()
+
+// Get symbol ticker names for labels
+smt_sym1_ticker = smt_sym1_resolved != "" ? syminfo.ticker(smt_sym1_resolved) : ""
+smt_sym2_ticker = smt_sym2_resolved != "" ? syminfo.ticker(smt_sym2_resolved) : ""
 
 htf_label_show_input            = input.bool(true, 'HTF Label     ', group=group_label, inline = 'HTFlabel')
 settings.htf_label_show         := htf_label_show_input
@@ -723,26 +808,96 @@ CandleSetLow(array<Candle> candles, float l) =>
         if c.l < _l
             _l := c.l
     _l
+// CISD body area (bodies only) from CISD start through C2 extreme — returns [body_lo, body_hi, body_mid]
+GetCisdBodyRange(int cisd_start_idx, int extreme_bar_idx) =>
+    float body_hi = na
+    float body_lo = na
+    if not na(cisd_start_idx) and not na(extreme_bar_idx)
+        int off_a = bar_index - extreme_bar_idx
+        int off_b = bar_index - cisd_start_idx
+        int lo_off = math.max(0, math.min(off_a, off_b))
+        int hi_off = math.min(math.max(off_a, off_b), 500)
+        if lo_off <= hi_off
+            for i = lo_off to hi_off
+                float bt = math.max(open[i], close[i])
+                float bb = math.min(open[i], close[i])
+                body_hi := na(body_hi) ? bt : math.max(body_hi, bt)
+                body_lo := na(body_lo) ? bb : math.min(body_lo, bb)
+    float body_mid = not na(body_hi) and not na(body_lo) ? (body_hi + body_lo) / 2.0 : na
+    [body_lo, body_hi, body_mid]
+
+// Set C3 entry zone once: if C2 mid inside CISD body → C2 mid↔body mid; else C2 mid↔C3 open
+TrySetEntryZoneC3(Setup setup) =>
+    if settings.entry_zone_show and not setup.ez_c3_set and not setup.is_invalid and setup.is_post_c2 and setup.cisd_triggered and not na(setup.c2_mid) and not na(setup.c3_open) and not na(setup.cisd_start_idx) and not na(setup.extreme_bar_idx)
+        [body_lo, body_hi, body_mid] = GetCisdBodyRange(setup.cisd_start_idx, setup.extreme_bar_idx)
+        if not na(body_lo) and not na(body_hi) and not na(body_mid)
+            float c2m = setup.c2_mid
+            bool inside = c2m >= body_lo and c2m <= body_hi
+            float y2 = inside ? body_mid : setup.c3_open
+            setup.ez_c3_top := math.max(c2m, y2)
+            setup.ez_c3_bot := math.min(c2m, y2)
+            setup.ez_c3_set := true
+    setup
+
+// At C3 close / C4 open: always store C3 mid + C4 span (for Previous EQ); entry-zone box only if enabled
+TrySetEntryZoneC4(Setup setup, float c3_h, float c3_l, float c4_open_price, int left_time, int right_time) =>
+    if not setup.is_invalid and not na(c3_h) and not na(c3_l) and not na(c4_open_price)
+        float c3m = (c3_h + c3_l) / 2.0
+        setup.c3_mid := c3m
+        setup.c3_extreme := setup.is_bullish ? c3_l : c3_h
+        setup.c4_open := c4_open_price
+        setup.ez_c4_left_time := left_time
+        setup.ez_c4_right_time := right_time
+        if settings.entry_zone_show and not setup.ez_c4_set
+            setup.ez_c4_top := math.max(c3m, c4_open_price)
+            setup.ez_c4_bot := math.min(c3m, c4_open_price)
+            setup.ez_c4_set := true
+            setup.ez_c4_invalid := false
+    setup
+
+// Right edge for entry zone / EQ: grows with each LTF bar; once period ends, locks at final edge
+EntryZoneRight(int locked_right) =>
+    int developing = time_close
+    na(locked_right) ? developing : (time >= locked_right ? locked_right : math.min(developing, locked_right))
+
+// Chart Previous EQ on for this setup? (On Chart or Both)
+ShowChartEQ() =>
+    prev_eq_show and (drawings_type == 'On Chart' or drawings_type == 'Both')
+
+// HTF projection Previous EQ on for this setup? (HTF candle or Both)
+ShowHtfEQ() =>
+    prev_eq_show and (drawings_type == 'HTF candle' or drawings_type == 'Both')
+
+// Find array index of HTF candle by o_idx (-1 if not in projection)
+FindCandleIndex(array<Candle> candles, int o_idx) =>
+    int found = -1
+    if not na(o_idx) and candles.size() > 0
+        for i = 0 to candles.size() - 1
+            if candles.get(i).o_idx == o_idx
+                found := i
+                break
+    found
+
 // FindCISDLevel traces back from the extreme bar to find consecutive opposing candles
 // Returns [cisd_level, cisd_start_idx]
 // extreme_bar_idx: the bar index where lowest low (bullish) or highest high (bearish) occurred
 // bias: 1 for bullish candles (bearish setup), -1 for bearish candles (bullish setup)
 FindCISDLevel(int extreme_bar_idx, int bias) =>
     int offset = bar_index - extreme_bar_idx  // How many bars ago the extreme occurred
-
+    
     float cisd_price = na
     int cisd_idx = na
     bool found_first = false
-
+    
     // Start from the extreme bar itself and trace back
     for i = offset to math.min(offset + 500, bar_index)
         float c_open = open[i]
         float c_close = close[i]
         int candle_attitude = c_close > c_open ? 1 : c_close < c_open ? -1 : 0
-
+        
         if candle_attitude == 0
             continue
-
+        
         if not found_first
             if candle_attitude == bias
                 found_first := true
@@ -753,8 +908,220 @@ FindCISDLevel(int extreme_bar_idx, int bias) =>
                 break
             cisd_price := c_open
             cisd_idx := bar_index - i
-
+    
     [cisd_price, cisd_idx]
+
+// ——— IC-CISD (rebuild) ———
+// - Level = open of starting opposite candle; stays until proper shift or confirm
+// - Shift only: opposite → same-side (not doji) → new opposite that takes structure extreme
+// - Start bar may be swing middle; confirm on later body break
+// - Dot extreme updates every bar; on confirm keep highest high / lowest low
+// - Next arm only if new structure can exceed last confirmed IC extreme (reduces rapid tiny ICs)
+
+ICHardStop(Setup setup) =>
+    setup.is_invalid or setup.ez_c4_invalid or (not na(setup.ez_c4_right_time) and time >= setup.ez_c4_right_time)
+
+ClearICPending(Setup setup) =>
+    setup.ic_pending := false
+    setup.ic_level := na
+    setup.ic_start_idx := na
+    setup.ic_extreme := na
+    setup.ic_extreme_idx := na
+    setup.ic_seen_same_side := false
+    setup
+
+StopICDetection(Setup setup) =>
+    setup.ic_active := false
+    ClearICPending(setup)
+    setup
+
+ResetICCisd(Setup setup) =>
+    StopICDetection(setup)
+    setup.ic_last_extreme := na
+    if not na(setup.ic_list)
+        setup.ic_list.clear()
+    else
+        setup.ic_list := array.new<ICCisd>()
+    setup
+
+// Update running extreme for dot (every candle between start and confirm)
+ICTrackExtreme(Setup setup) =>
+    if setup.is_bullish
+        if na(setup.ic_extreme) or low < setup.ic_extreme
+            setup.ic_extreme := low
+            setup.ic_extreme_idx := bar_index
+    else
+        if na(setup.ic_extreme) or high > setup.ic_extreme
+            setup.ic_extreme := high
+            setup.ic_extreme_idx := bar_index
+    setup
+
+ICUpdate(Setup setup) =>
+    if not settings.ic_cisd_show
+        setup
+    else if ICHardStop(setup)
+        StopICDetection(setup)
+        setup
+    else if not setup.cisd_triggered or na(setup.cisd_end_idx)
+        if not setup.is_invalid and (setup.ic_active or setup.ic_pending)
+            ResetICCisd(setup)
+        else
+            StopICDetection(setup)
+        setup
+    else if bar_index <= setup.cisd_end_idx
+        if setup.ic_active or setup.ic_pending
+            ClearICPending(setup)
+            setup.ic_active := false
+        setup
+    else
+        if not setup.ic_active
+            setup.ic_active := true
+            if na(setup.ic_list)
+                setup.ic_list := array.new<ICCisd>()
+            ClearICPending(setup)
+
+        // Strict color: doji is neither (must not unlock shift)
+        bool opp_bar = setup.is_bullish ? (close < open) : (close > open)
+        bool same_bar = setup.is_bullish ? (close > open) : (close < open)
+
+        if setup.ic_pending
+            // Always refresh structure extreme for the dot
+            ICTrackExtreme(setup)
+
+            if same_bar
+                // Real same-side only (bearish on bearish setup) — unlocks a later shift
+                setup.ic_seen_same_side := true
+            else if opp_bar
+                // Shift only after same-side was seen, then new opposite takes extreme
+                // Consecutive opposite (2nd bullish, etc.): NEVER shift level — keep start open
+                bool takes_ext = setup.is_bullish ? (low <= setup.ic_extreme) : (high >= setup.ic_extreme)
+                if setup.ic_seen_same_side and takes_ext
+                    // Proper shift: new opposite after same-side, takes swing high/low
+                    setup.ic_level := open
+                    setup.ic_start_idx := bar_index
+                    setup.ic_extreme := setup.is_bullish ? low : high
+                    setup.ic_extreme_idx := bar_index
+                    setup.ic_seen_same_side := false
+                // else: keep original level (start candle open); extreme already tracked
+
+            // Body break (start may be swing middle; right candle confirms next bar+)
+            if bar_index > setup.ic_start_idx
+                bool broke = setup.is_bullish ? (close > setup.ic_level) : (close < setup.ic_level)
+                if broke
+                    ICCisd ic = ICCisd.new()
+                    ic.level := setup.ic_level
+                    ic.start_idx := setup.ic_start_idx
+                    ic.end_idx := bar_index
+                    ic.extreme_price := setup.ic_extreme
+                    ic.extreme_idx := setup.ic_extreme_idx
+                    if na(setup.ic_list)
+                        setup.ic_list := array.new<ICCisd>()
+                    array.push(setup.ic_list, ic)
+                    setup.ic_last_extreme := setup.ic_extreme
+                    ClearICPending(setup)
+        else
+            // Free: arm on opposite candle only if it can make a higher-high / lower-low vs last IC
+            // (start may be middle of swing; reduces right+1 / right+2 spam)
+            if opp_bar
+                float bar_ext = setup.is_bullish ? low : high
+                bool better = na(setup.ic_last_extreme) or (setup.is_bullish ? bar_ext < setup.ic_last_extreme : bar_ext > setup.ic_last_extreme)
+                if better
+                    setup.ic_pending := true
+                    setup.ic_level := open
+                    setup.ic_start_idx := bar_index
+                    setup.ic_extreme := bar_ext
+                    setup.ic_extreme_idx := bar_index
+                    setup.ic_seen_same_side := false
+    setup
+
+// ============================================================================
+// SMT Detection Helper
+// ============================================================================
+// Checks if comparison symbols show SMT divergence:
+// - Bearish: Current makes HH, but comparison makes LH (fails to make new high)
+// - Bullish: Current makes LL, but comparison makes HL (fails to make new low)
+// For inverse correlations, the logic is flipped appropriately.
+// IMPORTANT: Lines are drawn at CURRENT symbol's price levels, not comparison's!
+// Returns [has_smt, smt_x1, smt_x2, smt_y1, smt_y2, smt_symbol]
+
+CheckSMTDivergence(bool is_bearish, SMT_Tracker tracker_curr,
+                   SMT_Tracker tracker1, SMT_Tracker tracker2, bool sym1_enabled, bool sym2_enabled,
+                   bool sym1_inverse, bool sym2_inverse, string sym1_ticker, string sym2_ticker) =>
+    bool has_smt = false
+    int x1 = na
+    int x2 = na
+    float y1 = na
+    float y2 = na
+    string smt_sym = ""
+    
+    // Track which symbols triggered SMT for combined label
+    bool sym1_triggered = false
+    bool sym2_triggered = false
+    
+    // Current symbol's price action
+    bool curr_hh = tracker_curr.h > tracker_curr.prev_h  // Current makes higher high
+    bool curr_ll = tracker_curr.l < tracker_curr.prev_l  // Current makes lower low
+    bool curr_lh = not na(tracker_curr.prev_h) ? tracker_curr.h < tracker_curr.prev_h : false  // Current makes lower high
+    bool curr_hl = not na(tracker_curr.prev_l) ? tracker_curr.l > tracker_curr.prev_l : false  // Current makes higher low
+    
+    // Check Symbol 1 for SMT
+    if sym1_enabled and not na(tracker1.prev_h) and not na(tracker1.h) and not na(tracker_curr.prev_h)
+        bool comp_hh = tracker1.h > tracker1.prev_h
+        bool comp_ll = not na(tracker1.prev_l) ? tracker1.l < tracker1.prev_l : false
+        bool comp_lh = tracker1.h < tracker1.prev_h
+        bool comp_hl = not na(tracker1.prev_l) ? tracker1.l > tracker1.prev_l : false
+        
+        if is_bearish
+            // Current Leads: current HH, comparison LH (or inverse: current HH, comp HL)
+            bool curr_leads = sym1_inverse ? (curr_hh and comp_hl) : (curr_hh and comp_lh)
+            // Comparison Leads: comp HH, current LH (or inverse: comp LL, curr LH)
+            bool comp_leads = sym1_inverse ? (comp_ll and curr_lh) : (comp_hh and curr_lh)
+            if curr_leads or comp_leads
+                sym1_triggered := true
+        else
+            // Current Leads: current LL, comparison HL (or inverse: current LL, comp LH)
+            bool curr_leads = sym1_inverse ? (curr_ll and comp_lh) : (curr_ll and comp_hl)
+            // Comparison Leads: comp LL, current HL (or inverse: comp HH, curr HL)
+            bool comp_leads = sym1_inverse ? (comp_hh and curr_hl) : (comp_ll and curr_hl)
+            if curr_leads or comp_leads
+                sym1_triggered := true
+    
+    // Check Symbol 2 for SMT (independently, not early exit)
+    if sym2_enabled and not na(tracker2.prev_h) and not na(tracker2.h) and not na(tracker_curr.prev_h)
+        bool comp_hh = tracker2.h > tracker2.prev_h
+        bool comp_ll = not na(tracker2.prev_l) ? tracker2.l < tracker2.prev_l : false
+        bool comp_lh = tracker2.h < tracker2.prev_h
+        bool comp_hl = not na(tracker2.prev_l) ? tracker2.l > tracker2.prev_l : false
+        
+        if is_bearish
+            bool curr_leads = sym2_inverse ? (curr_hh and comp_hl) : (curr_hh and comp_lh)
+            bool comp_leads = sym2_inverse ? (comp_ll and curr_lh) : (comp_hh and curr_lh)
+            if curr_leads or comp_leads
+                sym2_triggered := true
+        else
+            bool curr_leads = sym2_inverse ? (curr_ll and comp_lh) : (curr_ll and comp_hl)
+            bool comp_leads = sym2_inverse ? (comp_hh and curr_hl) : (comp_ll and curr_hl)
+            if curr_leads or comp_leads
+                sym2_triggered := true
+    
+    // Set output if any SMT detected
+    if sym1_triggered or sym2_triggered
+        has_smt := true
+        // Coordinates are always the current symbol's (same for both)
+        if is_bearish
+            x1 := tracker_curr.prev_h_idx
+            x2 := tracker_curr.h_idx
+            y1 := tracker_curr.prev_h
+            y2 := tracker_curr.h
+        else
+            x1 := tracker_curr.prev_l_idx
+            x2 := tracker_curr.l_idx
+            y1 := tracker_curr.prev_l
+            y2 := tracker_curr.l
+        // Combine ticker names when both trigger (like HTF SMT)
+        smt_sym := sym1_triggered and sym2_triggered ? sym1_ticker + "/" + sym2_ticker : sym1_triggered ? sym1_ticker : sym2_ticker
+    
+    [has_smt, x1, x2, y1, y2, smt_sym]
 
 // ============================================================================
 // Drawing Bin Methods
@@ -804,7 +1171,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
     // On first LTF bar of new HTF candle, the previous completed HTF is at index 0 (not shifted yet)
     // On subsequent bars, it's at index 1
     int prev_idx = isNewHTFCandle ? 0 : 1
-
+    
     if candleSet.candles.size() > prev_idx
         Candle prev_htf = candleSet.candles.get(prev_idx)  // Previous completed HTF candle (to be swept)
         bool high_breached = high > prev_htf.h
@@ -812,10 +1179,10 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
         bool high_sweep_confirmed = high_breached and close < prev_htf.h
         bool low_sweep_confirmed = low_breached and close > prev_htf.l
 
-        // ===== MITIGATION TRACKING FOR CONFIRMED SETUPS =====
+        // ===== MITIGATION + C4 ENTRY ZONE INVALIDATION FOR CONFIRMED SETUPS =====
         for [i, setup] in candleSet.setups
             // Only check mitigation if setup is still within C4 window
-            if setup.cisd_triggered and time < setup.liq_end_time
+            if setup.cisd_triggered and not na(setup.liq_end_time) and time < setup.liq_end_time
                 if setup.is_bullish
                     // Bullish: check if high crosses liq levels
                     if not na(setup.liq_c1_price) and na(setup.liq_c1_mitigated_idx)
@@ -824,6 +1191,10 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     if not na(setup.liq_c0_price) and na(setup.liq_c0_mitigated_idx)
                         if high >= setup.liq_c0_price
                             setup.liq_c0_mitigated_idx := bar_index
+                    // C4 invalidation (after C3 complete): beyond C3 low — stop EQ + drop zone
+                    if not setup.ez_c4_invalid and not na(setup.c3_extreme) and not na(setup.ez_c4_left_time) and low < setup.c3_extreme
+                        setup.ez_c4_invalid := true
+                        setup.ez_c4_invalid_time := time_close
                 else
                     // Bearish: check if low crosses liq levels
                     if not na(setup.liq_c1_price) and na(setup.liq_c1_mitigated_idx)
@@ -832,6 +1203,11 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     if not na(setup.liq_c0_price) and na(setup.liq_c0_mitigated_idx)
                         if low <= setup.liq_c0_price
                             setup.liq_c0_mitigated_idx := bar_index
+                    // C4 invalidation (after C3 complete): beyond C3 high — stop EQ + drop zone
+                    if not setup.ez_c4_invalid and not na(setup.c3_extreme) and not na(setup.ez_c4_left_time) and high > setup.c3_extreme
+                        setup.ez_c4_invalid := true
+                        setup.ez_c4_invalid_time := time_close
+                ICUpdate(setup)
 
         // ===== BEARISH TRACKING (when high is wicked) =====
         if not candleSet.has_live_bearish
@@ -879,22 +1255,40 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     if c0.l < prev_htf.l
                         setup.liq_c0_price := c0.l
                         setup.liq_c0_start_idx := c0.l_idx
+                // SMT detection - check if comparison symbol fails to make HH
+                if smt_show_input
+                    [has_smt, x1, x2, y1, y2, sym_name] = CheckSMTDivergence(true, smt_tracker_curr,
+                        smt_tracker1, smt_tracker2, true, smt_sym2_enable_input,
+                        smt_sym1_inverse, smt_sym2_inverse, smt_sym1_ticker, smt_sym2_ticker)
+                    if has_smt
+                        setup.has_smt := true
+                        // Use accurate Candle data for coordinates:
+                        // C1 (prev HTF) high is fixed, C2 (current) uses tracked extreme
+                        setup.smt_x1 := prev_htf.h_idx    // C1's exact high bar
+                        setup.smt_y1 := prev_htf.h        // C1's exact high price
+                        setup.smt_x2 := setup.extreme_bar_idx  // C2's running high bar
+                        setup.smt_y2 := setup.tracked_extreme  // C2's running high price
+                        setup.smt_symbol := sym_name
                 candleSet.live_bearish := setup
                 candleSet.has_live_bearish := true
         else
             // Bearish tracking exists - update extreme and check CISD
             setup = candleSet.live_bearish
-
+            
             if not setup.is_post_c2
                 // C2 phase: dynamic sweep confirmation
                 setup.is_confirmed := close < setup.sweep_price
-
+                
                 // Update extreme if new high made
                 if high > setup.tracked_extreme
                     setup.tracked_extreme := high
                     setup.extreme_bar_idx := bar_index
                     setup.c2_x := bar_index
                     setup.c2_y := high
+                    // Sync SMT coordinates if SMT was detected
+                    if setup.has_smt
+                        setup.smt_x2 := bar_index
+                        setup.smt_y2 := high
                     // Recalculate CISD from new extreme
                     [new_cisd_price, new_cisd_idx] = FindCISDLevel(bar_index, 1)
                     if not na(new_cisd_price)
@@ -902,7 +1296,8 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.cisd_start_idx := new_cisd_idx
                         setup.has_cisd := true
                         setup.cisd_triggered := false  // Reset trigger on new extreme
-
+                        ResetICCisd(setup)  // IC must wait for new main CISD confirm
+                
                 // CISD trigger detection (only when sweep is confirmed)
                 if setup.is_confirmed and setup.has_cisd and not setup.cisd_triggered
                     if close < setup.cisd_level
@@ -923,15 +1318,8 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         // Live/Potential alert for bearish CISD trigger
                         if settings.live_alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
                             alert(BuildAlertMessage(candleSet.settings.htf, false, true), alert.freq_once_per_bar)
-                        // Position Sizer calculation (bearish C2 phase)
-                        if settings.ps_show
-                            setup.ps_entry := setup.cisd_level
-                            setup.ps_stop := setup.tracked_extreme
-                            float risk = setup.ps_stop - setup.ps_entry
-                            setup.ps_target := setup.ps_entry - (risk * settings.ps_rr)
-                            setup.ps_start_idx := bar_index
-                            setup.ps_end_time := isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : (time_close(candleSet.settings.htf) + timeframe.in_seconds(candleSet.settings.htf) * 1000)
-
+                        ResetICCisd(setup)  // clean slate; IC starts next LTF after this confirm
+                
                 // Liquidity mitigation check (bearish: price crosses DOWN through liq level)
                 if not na(setup.liq_c1_price) and na(setup.liq_c1_mitigated_idx)
                     if low <= setup.liq_c1_price
@@ -939,15 +1327,17 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                 if not na(setup.liq_c0_price) and na(setup.liq_c0_mitigated_idx)
                     if low <= setup.liq_c0_price
                         setup.liq_c0_mitigated_idx := bar_index
+                ICUpdate(setup)
             else
                 // Post-C2 phase: check for invalidation, cancellation, or CISD trigger
                 bool setup_replaced = false
-
+                
                 if high > setup.c2_extreme
                     if setup.cisd_triggered
                         // CISD already triggered - this is an INVALIDATION
                         // Push invalidated setup to history (will show as xC2)
                         setup.is_invalid := true
+                        StopICDetection(setup)  // keep confirmed IC marks with this setup
                         candleSet.setups.unshift(setup)
                         // Also create a new concurrent setup (same as cascade)
                         Candle old_c2 = candleSet.candles.get(1)  // C2 is at index 1
@@ -1015,7 +1405,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         // Replace live setup with new one
                         candleSet.live_bearish := new_setup
                         setup_replaced := true
-
+                
                 // Only continue tracking if setup wasn't replaced
                 if not setup_replaced
                     // Liquidity mitigation check (post-C2 bearish)
@@ -1025,7 +1415,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     if not na(setup.liq_c0_price) and na(setup.liq_c0_mitigated_idx)
                         if low <= setup.liq_c0_price
                             setup.liq_c0_mitigated_idx := bar_index
-
+                    
                     // CISD trigger check
                     if setup.has_cisd and not setup.cisd_triggered and close < setup.cisd_level
                         // CISD triggered - capture data but DON'T push to history yet (wait for C3 close)
@@ -1045,17 +1435,12 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                             setup.proj_anchor_0 := math.min(open[cisd_lookback], close[cisd_lookback])
                         // Calculate C4 end time (current + 1 HTF duration)
                         setup.liq_end_time := isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : (time_close(candleSet.settings.htf) + timeframe.in_seconds(candleSet.settings.htf) * 1000)
+                        TrySetEntryZoneC3(setup)
                         // Confirmed alert for bearish CISD trigger (post-C2 = already confirmed)
                         if settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
                             alert(BuildAlertMessage(candleSet.settings.htf, false, false), alert.freq_once_per_bar)
-                        // Position Sizer calculation (bearish post-C2)
-                        if settings.ps_show
-                            setup.ps_entry := setup.cisd_level
-                            setup.ps_stop := setup.c2_extreme
-                            float risk = setup.ps_stop - setup.ps_entry
-                            setup.ps_target := setup.ps_entry - (risk * settings.ps_rr)
-                            setup.ps_start_idx := bar_index
-                            setup.ps_end_time := setup.liq_end_time
+                if not setup_replaced
+                    ICUpdate(setup)
 
         // ===== BULLISH TRACKING (when low is wicked) =====
         if not candleSet.has_live_bullish
@@ -1103,22 +1488,40 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     if c0.h > prev_htf.h
                         setup.liq_c0_price := c0.h
                         setup.liq_c0_start_idx := c0.h_idx
+                // SMT detection - check if comparison symbol fails to make LL
+                if smt_show_input
+                    [has_smt, x1, x2, y1, y2, sym_name] = CheckSMTDivergence(false, smt_tracker_curr,
+                        smt_tracker1, smt_tracker2, true, smt_sym2_enable_input,
+                        smt_sym1_inverse, smt_sym2_inverse, smt_sym1_ticker, smt_sym2_ticker)
+                    if has_smt
+                        setup.has_smt := true
+                        // Use accurate Candle data for coordinates:
+                        // C1 (prev HTF) low is fixed, C2 (current) uses tracked extreme
+                        setup.smt_x1 := prev_htf.l_idx    // C1's exact low bar
+                        setup.smt_y1 := prev_htf.l        // C1's exact low price
+                        setup.smt_x2 := setup.extreme_bar_idx  // C2's running low bar
+                        setup.smt_y2 := setup.tracked_extreme  // C2's running low price
+                        setup.smt_symbol := sym_name
                 candleSet.live_bullish := setup
                 candleSet.has_live_bullish := true
         else
             // Bullish tracking exists - update extreme and check CISD
             setup = candleSet.live_bullish
-
+            
             if not setup.is_post_c2
                 // C2 phase: dynamic sweep confirmation
                 setup.is_confirmed := close > setup.sweep_price
-
+                
                 // Update extreme if new low made
                 if low < setup.tracked_extreme
                     setup.tracked_extreme := low
                     setup.extreme_bar_idx := bar_index
                     setup.c2_x := bar_index
                     setup.c2_y := low
+                    // Sync SMT coordinates if SMT was detected
+                    if setup.has_smt
+                        setup.smt_x2 := bar_index
+                        setup.smt_y2 := low
                     // Recalculate CISD from new extreme
                     [new_cisd_price, new_cisd_idx] = FindCISDLevel(bar_index, -1)
                     if not na(new_cisd_price)
@@ -1126,7 +1529,8 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.cisd_start_idx := new_cisd_idx
                         setup.has_cisd := true
                         setup.cisd_triggered := false  // Reset trigger on new extreme
-
+                        ResetICCisd(setup)  // IC must wait for new main CISD confirm
+                
                 // CISD trigger detection (only when sweep is confirmed)
                 if setup.is_confirmed and setup.has_cisd and not setup.cisd_triggered
                     if close > setup.cisd_level
@@ -1147,15 +1551,8 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         // Live/Potential alert for bullish CISD trigger
                         if settings.live_alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
                             alert(BuildAlertMessage(candleSet.settings.htf, true, true), alert.freq_once_per_bar)
-                        // Position Sizer calculation (bullish C2 phase)
-                        if settings.ps_show
-                            setup.ps_entry := setup.cisd_level
-                            setup.ps_stop := setup.tracked_extreme
-                            float risk = setup.ps_entry - setup.ps_stop
-                            setup.ps_target := setup.ps_entry + (risk * settings.ps_rr)
-                            setup.ps_start_idx := bar_index
-                            setup.ps_end_time := isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : (time_close(candleSet.settings.htf) + timeframe.in_seconds(candleSet.settings.htf) * 1000)
-
+                        ResetICCisd(setup)  // clean slate; IC starts next LTF after this confirm
+                
                 // Liquidity mitigation check (bullish: price crosses UP through liq level)
                 if not na(setup.liq_c1_price) and na(setup.liq_c1_mitigated_idx)
                     if high >= setup.liq_c1_price
@@ -1163,15 +1560,17 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                 if not na(setup.liq_c0_price) and na(setup.liq_c0_mitigated_idx)
                     if high >= setup.liq_c0_price
                         setup.liq_c0_mitigated_idx := bar_index
+                ICUpdate(setup)
             else
                 // Post-C2 phase: check for invalidation, cancellation, or CISD trigger
                 bool setup_replaced = false
-
+                
                 if low < setup.c2_extreme
                     if setup.cisd_triggered
                         // CISD already triggered - this is an INVALIDATION
                         // Push invalidated setup to history (will show as xC2)
                         setup.is_invalid := true
+                        StopICDetection(setup)  // keep confirmed IC marks with this setup
                         candleSet.setups.unshift(setup)
                         // Also create a new concurrent setup (same as cascade)
                         Candle old_c2 = candleSet.candles.get(1)  // C2 is at index 1
@@ -1239,7 +1638,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         // Replace live setup with new one
                         candleSet.live_bullish := new_setup
                         setup_replaced := true
-
+                
                 // Only continue tracking if setup wasn't replaced
                 if not setup_replaced
                     // Liquidity mitigation check (post-C2 bullish)
@@ -1249,7 +1648,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     if not na(setup.liq_c0_price) and na(setup.liq_c0_mitigated_idx)
                         if high >= setup.liq_c0_price
                             setup.liq_c0_mitigated_idx := bar_index
-
+                    
                     // CISD trigger check
                     if setup.has_cisd and not setup.cisd_triggered and close > setup.cisd_level
                         // CISD triggered - capture data but DON'T push to history yet (wait for C3 close)
@@ -1269,30 +1668,25 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                             setup.proj_anchor_0 := math.max(open[cisd_lookback], close[cisd_lookback])
                         // Calculate C4 end time (current + 1 HTF duration)
                         setup.liq_end_time := isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : (time_close(candleSet.settings.htf) + timeframe.in_seconds(candleSet.settings.htf) * 1000)
+                        TrySetEntryZoneC3(setup)
                         // Confirmed alert for bullish CISD trigger (post-C2 = already confirmed)
                         if settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
                             alert(BuildAlertMessage(candleSet.settings.htf, true, false), alert.freq_once_per_bar)
-                        // Position Sizer calculation (bullish post-C2)
-                        if settings.ps_show
-                            setup.ps_entry := setup.cisd_level
-                            setup.ps_stop := setup.c2_extreme
-                            float risk = setup.ps_entry - setup.ps_stop
-                            setup.ps_target := setup.ps_entry + (risk * settings.ps_rr)
-                            setup.ps_start_idx := bar_index
-                            setup.ps_end_time := setup.liq_end_time
+                if not setup_replaced
+                    ICUpdate(setup)
 
     if isNewHTFCandle
         // Handle live setups on HTF candle close
         // C2 close: Don't push to history, start post-C2 tracking
         // C3 close: Remove if CISD not triggered (time limit)
-
+        
         // Handle bearish live setup
         if candleSet.has_live_bearish
             Setup setup = candleSet.live_bearish
             // Only handle if setup was created before this bar
             if setup.sweep_bar_idx != bar_index
                 setup.htf_count := setup.htf_count + 1
-
+                
                 if not setup.is_post_c2
                     // C2 just closed - check confirmation using C2's actual close (previous bar)
                     bool c2_confirmed = close[1] < setup.sweep_price
@@ -1302,6 +1696,10 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.is_confirmed := true  // Lock in confirmation status
                         setup.ltf_end_idx := bar_index  // Lock sweep line end at C3 start
                         setup.c2_extreme := candleSet.candles.first().h  // C2's high for price limit
+                        setup.c2_mid := (candleSet.candles.first().h + candleSet.candles.first().l) / 2.0
+                        setup.c3_open := open
+                        setup.ez_c3_left_time := time
+                        TrySetEntryZoneC3(setup)
                         // Note: Even if CISD triggered during C2, continue to post-C2 tracking
                         // to check for invalidation during C3. Will push to history at C3 close.
                         // Confirmed alert if CISD already triggered during C2
@@ -1331,16 +1729,20 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                                     setup.proj_anchor_0 := math.min(open[cisd_lookback], close[cisd_lookback])
                             // Calculate C4 end time (current + 1 HTF duration since C3 just closed)
                             setup.liq_end_time := isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : (time_close(candleSet.settings.htf) + timeframe.in_seconds(candleSet.settings.htf) * 1000)
+                            setup.ez_c3_right_time := time  // Lock C3 zone to C3 close / C4 open
+                            // C4 entry zone at C4 open (this bar); C3 candle is still first() before unshift
+                            int ez_c4_right = isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : time_close(candleSet.settings.htf)
+                            TrySetEntryZoneC4(setup, candleSet.candles.first().h, candleSet.candles.first().l, open, time, ez_c4_right)
                             candleSet.setups.unshift(setup)
                         candleSet.has_live_bearish := false
-
+        
         // Handle bullish live setup
         if candleSet.has_live_bullish
             Setup setup = candleSet.live_bullish
             // Only handle if setup was created before this bar
             if setup.sweep_bar_idx != bar_index
                 setup.htf_count := setup.htf_count + 1
-
+                
                 if not setup.is_post_c2
                     // C2 just closed - check confirmation using C2's actual close (previous bar)
                     bool c2_confirmed = close[1] > setup.sweep_price
@@ -1350,6 +1752,10 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.is_confirmed := true  // Lock in confirmation status
                         setup.ltf_end_idx := bar_index  // Lock sweep line end at C3 start
                         setup.c2_extreme := candleSet.candles.first().l  // C2's low for price limit
+                        setup.c2_mid := (candleSet.candles.first().h + candleSet.candles.first().l) / 2.0
+                        setup.c3_open := open
+                        setup.ez_c3_left_time := time
+                        TrySetEntryZoneC3(setup)
                         // Note: Even if CISD triggered during C2, continue to post-C2 tracking
                         // to check for invalidation during C3. Will push to history at C3 close.
                         // Confirmed alert if CISD already triggered during C2
@@ -1379,9 +1785,13 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                                     setup.proj_anchor_0 := math.max(open[cisd_lookback], close[cisd_lookback])
                             // Calculate C4 end time (current + 1 HTF duration since C3 just closed)
                             setup.liq_end_time := isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : (time_close(candleSet.settings.htf) + timeframe.in_seconds(candleSet.settings.htf) * 1000)
+                            setup.ez_c3_right_time := time  // Lock C3 zone to C3 close / C4 open
+                            // C4 entry zone at C4 open (this bar); C3 candle is still first() before unshift
+                            int ez_c4_right_bull = isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : time_close(candleSet.settings.htf)
+                            TrySetEntryZoneC4(setup, candleSet.candles.first().h, candleSet.candles.first().l, open, time, ez_c4_right_bull)
                             candleSet.setups.unshift(setup)
                         candleSet.has_live_bullish := false
-
+        
         Candle candle = Candle.new()
         candle.o := open
         candle.c := close
@@ -1408,7 +1818,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                 str.format_time(candle.o_time, 'HH:mm', 'America/New_York')
 
         candleSet.candles.unshift(candle)
-
+        
         // Set close time on previous candle (now at index 1)
         if candleSet.candles.size() > 1
             Candle prev = candleSet.candles.get(1)
@@ -1433,7 +1843,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     sweep.ltf_end_idx := candle.o_idx
                     sweep.is_high := true
                     candleSet.sweeps.push(sweep)
-
+                    
                 if low_sweep_condition
                     Sweep sweep = Sweep.new()
                     sweep.price := prev_prev_candle.l
@@ -1443,7 +1853,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     sweep.ltf_end_idx := candle.o_idx
                     sweep.is_high := false
                     candleSet.sweeps.push(sweep)
-
+                
                 // Limit setups storage - store 2x to ensure enough of each bias type when filtering
                 int max_setups = (candleSet.settings.max_display + settings.sweep_history) * 2
                 while candleSet.setups.size() > max_setups
@@ -1454,7 +1864,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
             Candle delCandle = array.pop(candleSet.candles)
             // Clean up sweeps associated with the deleted candle
             if candleSet.sweeps.size() > 0
-                for i = candleSet.sweeps.size() - 1 to 0 by -1
+                for i = candleSet.sweeps.size() - 1 to 0 by 1
                     Sweep sweep = candleSet.sweeps.get(i)
                     if sweep.swept_candle_idx == delCandle.o_idx
                         candleSet.sweeps.remove(i)
@@ -1529,7 +1939,7 @@ method DrawVTHLLines(CandleSet candleSet) =>
     // Draw VT lines and HL lines - these are on the LTF chart, not the HTF projection
     vt_line_style = LineStyle(candleSet.settings.vt_style)
     hl_line_style = LineStyle(candleSet.settings.hl_style)
-
+    
     for [i, candle] in candleSet.candles
         // Draw vertical line
         if candleSet.settings.vt_show
@@ -1566,11 +1976,11 @@ method DrawLabels(CandleSet candleSet, int offset) =>
         top = CandleSetHigh(candleSet.candles, 0)
         bottom = CandleSetLow(candleSet.candles, top)
         left = bar_index + offset + (settings.width + 1) * (size - 1) / 2
-
+        
         string lbl_text = HTFName(candleSet.settings.htf)
         if settings.htf_timer_show
             lbl_text := lbl_text + '\n\n(' + RemainingTime(candleSet.settings.htf) + ')'
-
+        
         if settings.label_position == 'Both' or settings.label_position == 'Top'
             bin.labels.push(label.new(left, top, lbl_text, color = color_transparent, textcolor = settings.htf_label_color, style = label.style_label_down, size = settings.htf_label_size))
         if settings.label_position == 'Both' or settings.label_position == 'Bottom'
@@ -1588,29 +1998,29 @@ method DrawSetups(CandleSet candleSet) =>
     // Cache style calculations once for both sections
     sweep_line_style = LineStyle(settings.sweep_style)
     cisd_line_style = LineStyle(settings.cisd_style)
-
+    
     // Draw confirmed setups
     if candleSet.setups.size() > 0
         int non_visible_count = 0
         int total_count = 0
-
+        
         for [i, setup] in candleSet.setups
             // Skip if not confirmed
             if not setup.is_confirmed
                 continue
-
+            
             // Apply bias filter - skip if bias doesn't match
             bool bias_ok = settings.bias == 'Neutral' or (settings.bias == 'Bullish' and setup.is_bullish) or (settings.bias == 'Bearish' and not setup.is_bullish)
             if not bias_ok
                 continue
-
+            
             // Check if setup's HTF candle is visible
             bool is_visible = false
             for [j, candle] in candleSet.candles
                 if candle.o_idx == setup.htf_candle_idx
                     is_visible := true
                     break
-
+            
             // Determine if we should draw this setup
             bool should_draw = false
             if settings.sweep_visible_only
@@ -1623,12 +2033,12 @@ method DrawSetups(CandleSet candleSet) =>
                 if total_count < settings.sweep_history
                     should_draw := true
                     total_count := total_count + 1
-
+            
             if should_draw
                 // ==== LAYER 1: LIQUIDITY LINES (behind) - SKIP if invalid ====
                 if not setup.is_invalid and settings.liq_show and setup.cisd_triggered and not na(setup.liq_c1_price) and not na(setup.liq_end_time)
                     liq_line_style = LineStyle(settings.liq_style)
-
+                    
                     // Calculate C1 end point: mitigation bar, current bar (if developing), or C4 end
                     int c1_start_time = time[bar_index - setup.liq_c1_start_idx]
                     int c1_end_time = na
@@ -1638,9 +2048,9 @@ method DrawSetups(CandleSet candleSet) =>
                         c1_end_time := time  // Developing: extend to current bar
                     else
                         c1_end_time := setup.liq_end_time
-                    bin.lines.push(line.new(c1_start_time, setup.liq_c1_price, c1_end_time, setup.liq_c1_price,
+                    bin.lines.push(line.new(c1_start_time, setup.liq_c1_price, c1_end_time, setup.liq_c1_price, 
                         xloc = xloc.bar_time, color = settings.liq_color, style = liq_line_style, width = settings.liq_width))
-
+                    
                     // Draw C0 liquidity line if condition was met
                     if not na(setup.liq_c0_price)
                         int c0_start_time = time[bar_index - setup.liq_c0_start_idx]
@@ -1651,15 +2061,15 @@ method DrawSetups(CandleSet candleSet) =>
                             c0_end_time := time  // Developing: extend to current bar
                         else
                             c0_end_time := setup.liq_end_time
-                        bin.lines.push(line.new(c0_start_time, setup.liq_c0_price, c0_end_time, setup.liq_c0_price,
+                        bin.lines.push(line.new(c0_start_time, setup.liq_c0_price, c0_end_time, setup.liq_c0_price, 
                             xloc = xloc.bar_time, color = settings.liq_color, style = liq_line_style, width = settings.liq_width))
-
+                
                 // ==== LAYER 2: PROJECTIONS - SKIP if invalid ====
                 if not setup.is_invalid and settings.proj_show and setup.cisd_triggered and not na(setup.proj_anchor_1) and not na(setup.proj_anchor_0)
                     proj_line_style = LineStyle(settings.proj_style)
                     proj_label_sz = LabelSize(settings.proj_label_size)
                     float proj_range = setup.proj_anchor_1 - setup.proj_anchor_0
-
+                    
                     for dv = 0 to proj_deviations.size() - 1
                         dev = proj_deviations.get(dv)
                         float price = na
@@ -1667,25 +2077,25 @@ method DrawSetups(CandleSet candleSet) =>
                             price := setup.proj_anchor_0 - (math.abs(proj_range) * dev)
                         else
                             price := setup.proj_anchor_0 + (proj_range * dev)
-
-                        bin.lines.push(line.new(setup.proj_start_idx, price, setup.proj_end_idx, price,
+                        
+                        bin.lines.push(line.new(setup.proj_start_idx, price, setup.proj_end_idx, price, 
                             color = settings.proj_color, style = proj_line_style, width = settings.proj_width))
-
+                        
                         if settings.proj_label_show
-                            bin.labels.push(label.new(setup.proj_start_idx, price, str.tostring(dev),
-                                color = color_transparent, textcolor = settings.proj_color,
+                            bin.labels.push(label.new(setup.proj_start_idx, price, str.tostring(dev), 
+                                color = color_transparent, textcolor = settings.proj_color, 
                                 style = label.style_label_right, size = proj_label_sz))
-
+                
                 // ==== LAYER 3: C2 LABEL - show "xC2" in red if invalid ====
                 lbl_style = setup.is_bullish ? label.style_label_up : label.style_label_down
                 string lbl_text = setup.is_invalid ? "xC2" : "C2"
                 color lbl_color = setup.is_invalid ? color.red : settings.c2_color
                 bin.labels.push(label.new(setup.c2_x, setup.c2_y, lbl_text, color = color_transparent, textcolor = lbl_color, style = lbl_style, size = settings.c2_size))
-
+                
                 // ==== LAYER 4: SWEEP LINES (near top) - SKIP if invalid ====
                 if not setup.is_invalid and settings.sweep_show
                     bin.lines.push(line.new(setup.sweep_ltf_idx, setup.sweep_price, setup.ltf_end_idx, setup.sweep_price, color = settings.sweep_color, style = sweep_line_style, width = settings.sweep_size))
-
+                
                 // Draw HTF sweep line - only when projection is visible, SKIP if invalid
                 if not setup.is_invalid and not settings.hide_candles
                     int htf_x1 = na
@@ -1698,31 +2108,110 @@ method DrawSetups(CandleSet candleSet) =>
                     if not na(htf_x1) and not na(htf_x2)
                         if settings.sweep_show
                             bin.lines.push(line.new(htf_x1, setup.sweep_price, htf_x2, setup.sweep_price, color = settings.sweep_color, style = sweep_line_style, width = settings.sweep_size))
-
+                
                 // ==== LAYER 5: CISD LINE (on top) ====
                 if settings.cisd_show and setup.cisd_triggered and setup.has_cisd
                     cisd_color = setup.is_bullish ? settings.cisd_bull_color : settings.cisd_bear_color
                     // Extend 1 bar beyond trigger
                     bin.lines.push(line.new(setup.cisd_start_idx, setup.cisd_level, setup.cisd_end_idx + 1, setup.cisd_level, color = cisd_color, style = cisd_line_style, width = settings.cisd_width))
-
-                // ==== LAYER 6: POSITION SIZER BOXES ====
-                if settings.ps_show and setup.cisd_triggered and not na(setup.ps_entry)
-                    // Calculate box end: TP/SL hit bar, or HTF end, or current bar if still active
-                    int ps_end_x = bar_index
-                    if setup.ps_hit_target or setup.ps_hit_stop
-                        ps_end_x := setup.ps_start_idx + math.round((bar_index - setup.ps_start_idx) * 0.3)  // Shortened if hit
-                    else if not na(setup.ps_end_time) and time > setup.ps_end_time
-                        // HTF ended, find the bar close to end time
-                        ps_end_x := setup.ps_start_idx + 10  // Approximate
-
-                    // Risk box (entry to stop)
-                    if setup.is_bullish
-                        bin.boxes.push(box.new(setup.ps_start_idx, setup.ps_entry, ps_end_x, setup.ps_stop, border_color = color.new(na, 100), bgcolor = settings.ps_risk_color))
-                        bin.boxes.push(box.new(setup.ps_start_idx, setup.ps_target, ps_end_x, setup.ps_entry, border_color = color.new(na, 100), bgcolor = settings.ps_reward_color))
-                    else
-                        bin.boxes.push(box.new(setup.ps_start_idx, setup.ps_stop, ps_end_x, setup.ps_entry, border_color = color.new(na, 100), bgcolor = settings.ps_risk_color))
-                        bin.boxes.push(box.new(setup.ps_start_idx, setup.ps_entry, ps_end_x, setup.ps_target, border_color = color.new(na, 100), bgcolor = settings.ps_reward_color))
-
+                
+                // ==== LAYER 5b: IC-CISD (confirmed only) ====
+                if settings.ic_cisd_show and not na(setup.ic_list) and setup.ic_list.size() > 0
+                    color ic_col = setup.is_bullish ? settings.cisd_bull_color : settings.cisd_bear_color
+                    for ic_i = 0 to setup.ic_list.size() - 1
+                        ICCisd ic = setup.ic_list.get(ic_i)
+                        if not na(ic.level) and not na(ic.start_idx) and not na(ic.end_idx)
+                            bin.lines.push(line.new(ic.start_idx, ic.level, ic.end_idx, ic.level, color = ic_col, style = cisd_line_style, width = settings.cisd_width))
+                        if not na(ic.extreme_price) and not na(ic.extreme_idx)
+                            ic_dot_style = setup.is_bullish ? label.style_label_up : label.style_label_down
+                            bin.labels.push(label.new(ic.extreme_idx, ic.extreme_price, "●", color = color_transparent, textcolor = ic_col, style = ic_dot_style, size = size.tiny))
+                
+                // ==== LAYER 6: SMT LINE - SKIP if invalid ====
+                if not setup.is_invalid and smt_show_input and setup.has_smt and not na(setup.smt_x1) and not na(setup.smt_x2)
+                    smt_line_style_hist = LineStyle(smt_line_style_input)
+                    // Draw line from prev high/low to current high/low
+                    bin.lines.push(line.new(setup.smt_x1, setup.smt_y1, setup.smt_x2, setup.smt_y2, 
+                        color = smt_color_input, style = smt_line_style_hist, width = smt_line_width_input))
+                    // Draw label at midpoint
+                    if smt_label_show_input
+                        int mid_x_hist = math.round((setup.smt_x1 + setup.smt_x2) / 2)
+                        float mid_y_hist = (setup.smt_y1 + setup.smt_y2) / 2
+                        lbl_style_smt_hist = setup.is_bullish ? label.style_label_up : label.style_label_down
+                        bin.labels.push(label.new(mid_x_hist, mid_y_hist, setup.smt_symbol, 
+                            color = color_transparent, textcolor = smt_color_input, 
+                            style = lbl_style_smt_hist, size = LabelSize(smt_label_size_input)))
+                
+                // ==== LAYER 7: PREVIOUS EQ (chart) — after confirmed; C2 mid on C3, C3 mid on C4 ====
+                if not setup.is_invalid and setup.is_confirmed and ShowChartEQ()
+                    eq_line_style = LineStyle(prev_eq_style)
+                    // C2 EQ across C3 window
+                    if not na(setup.c2_mid) and not na(setup.ez_c3_left_time)
+                        int eq3_right = EntryZoneRight(setup.ez_c3_right_time)
+                        if eq3_right > setup.ez_c3_left_time
+                            bin.lines.push(line.new(setup.ez_c3_left_time, setup.c2_mid, eq3_right, setup.c2_mid,
+                                xloc = xloc.bar_time, color = prev_eq_color, style = eq_line_style, width = prev_eq_width))
+                    // C3 EQ across C4 window — if C4 invalid: stop at that LTF bar, red
+                    if not na(setup.c3_mid) and not na(setup.ez_c4_left_time)
+                        int eq4_right = setup.ez_c4_invalid and not na(setup.ez_c4_invalid_time) ? setup.ez_c4_invalid_time : EntryZoneRight(setup.ez_c4_right_time)
+                        color eq4_col = setup.ez_c4_invalid ? color.red : prev_eq_color
+                        if eq4_right > setup.ez_c4_left_time
+                            bin.lines.push(line.new(setup.ez_c4_left_time, setup.c3_mid, eq4_right, setup.c3_mid,
+                                xloc = xloc.bar_time, color = eq4_col, style = eq_line_style, width = prev_eq_width))
+                
+                // ==== LAYER 7b: PREVIOUS EQ (HTF projection) — C2 mid→C3 end+2, C3 mid→C4 end+2 ====
+                if not setup.is_invalid and setup.is_confirmed and ShowHtfEQ() and not settings.hide_candles
+                    int c2_i = FindCandleIndex(candleSet.candles, setup.htf_candle_idx)
+                    eq_htf_style = LineStyle(prev_eq_style)
+                    // C2 EQ: mid of C2 projection → end of C3 projection + 2 LTF bars
+                    if not na(setup.c2_mid) and c2_i > 0
+                        Candle c2_proj = candleSet.candles.get(c2_i)
+                        Candle c3_proj = candleSet.candles.get(c2_i - 1)
+                        int htf_eq3_x1 = c2_proj.wick_x
+                        int htf_eq3_x2 = c3_proj.candle_right + 2
+                        if htf_eq3_x2 > htf_eq3_x1
+                            bin.lines.push(line.new(htf_eq3_x1, setup.c2_mid, htf_eq3_x2, setup.c2_mid,
+                                color = prev_eq_color, style = eq_htf_style, width = prev_eq_width))
+                    // C3 EQ: mid of C3 projection → end of C4 projection + 2 LTF bars (red if C4 invalid)
+                    if not na(setup.c3_mid) and c2_i > 1
+                        Candle c3_proj4 = candleSet.candles.get(c2_i - 1)
+                        Candle c4_proj = candleSet.candles.get(c2_i - 2)
+                        int htf_eq4_x1 = c3_proj4.wick_x
+                        int htf_eq4_x2 = c4_proj.candle_right + 2
+                        color htf_eq4_col = setup.ez_c4_invalid ? color.red : prev_eq_color
+                        if htf_eq4_x2 > htf_eq4_x1
+                            bin.lines.push(line.new(htf_eq4_x1, setup.c3_mid, htf_eq4_x2, setup.c3_mid,
+                                color = htf_eq4_col, style = eq_htf_style, width = prev_eq_width))
+                
+                // ==== LAYER 8: ENTRY ZONE C3 - SKIP if invalid ====
+                // Label: bearish = top-left of box (label_down), bullish = bottom-left (label_up) — same gap style as C2; one candle right of left edge
+                // Zone right edge develops with LTF bars, then locks at C3 end
+                if not setup.is_invalid and settings.entry_zone_show and setup.ez_c3_set and not na(setup.ez_c3_left_time)
+                    color ez_col = setup.is_bullish ? settings.entry_zone_bull_color : settings.entry_zone_bear_color
+                    int ez_right = EntryZoneRight(setup.ez_c3_right_time)
+                    bin.boxes.push(box.new(setup.ez_c3_left_time, setup.ez_c3_top, ez_right, setup.ez_c3_bot,
+                        xloc = xloc.bar_time, bgcolor = ez_col, border_color = color_transparent, border_width = 0))
+                    float ez_lbl_y = setup.is_bullish ? setup.ez_c3_bot : setup.ez_c3_top
+                    int ez_lbl_x = setup.ez_c3_left_time + timeframe.in_seconds() * 1000
+                    lbl_style_ez = setup.is_bullish ? label.style_label_up : label.style_label_down
+                    bin.labels.push(label.new(ez_lbl_x, ez_lbl_y, "C3", xloc = xloc.bar_time,
+                        color = color_transparent, textcolor = settings.c2_color, style = lbl_style_ez, size = settings.c2_size))
+                
+                // ==== LAYER 9: ENTRY ZONE C4 — zone removed if invalidated; label becomes xC4 ====
+                // Zone right edge develops with LTF bars, then locks at C4 end
+                if not setup.is_invalid and settings.entry_zone_show and setup.ez_c4_set and not na(setup.ez_c4_left_time)
+                    color ez4_col = setup.is_bullish ? settings.entry_zone_bull_color : settings.entry_zone_bear_color
+                    int ez4_right = EntryZoneRight(setup.ez_c4_right_time)
+                    if not setup.ez_c4_invalid
+                        bin.boxes.push(box.new(setup.ez_c4_left_time, setup.ez_c4_top, ez4_right, setup.ez_c4_bot,
+                            xloc = xloc.bar_time, bgcolor = ez4_col, border_color = color_transparent, border_width = 0))
+                    float ez4_lbl_y = setup.is_bullish ? setup.ez_c4_bot : setup.ez_c4_top
+                    int ez4_lbl_x = setup.ez_c4_left_time + timeframe.in_seconds() * 1000
+                    string ez4_txt = setup.ez_c4_invalid ? "xC4" : "C4"
+                    color ez4_lbl_col = setup.ez_c4_invalid ? color.red : settings.c2_color
+                    lbl_style_ez4 = setup.is_bullish ? label.style_label_up : label.style_label_down
+                    bin.labels.push(label.new(ez4_lbl_x, ez4_lbl_y, ez4_txt, xloc = xloc.bar_time,
+                        color = color_transparent, textcolor = ez4_lbl_col, style = lbl_style_ez4, size = settings.c2_size))
+    
     // Draw live setups (both bullish and bearish)
     for is_bull in array.from(false, true)
         // Apply bias filter for live setups
@@ -1735,30 +2224,30 @@ method DrawSetups(CandleSet candleSet) =>
         setup = is_bull ? candleSet.live_bullish : candleSet.live_bearish
         if not (setup.is_confirmed or setup.is_post_c2)
             continue
-
+            
         // ==== LAYER 1: LIQUIDITY LINES (behind) - SKIP if invalid ====
         if not setup.is_invalid and settings.liq_show and setup.cisd_triggered and not na(setup.liq_c1_price)
             liq_line_style = LineStyle(settings.liq_style)
-
+            
             // C1 line: extend to current bar or stop at mitigation
             int c1_start_time = time[bar_index - setup.liq_c1_start_idx]
             int c1_end_time = not na(setup.liq_c1_mitigated_idx) ? time[bar_index - setup.liq_c1_mitigated_idx] : time
-            bin.lines.push(line.new(c1_start_time, setup.liq_c1_price, c1_end_time, setup.liq_c1_price,
+            bin.lines.push(line.new(c1_start_time, setup.liq_c1_price, c1_end_time, setup.liq_c1_price, 
                 xloc = xloc.bar_time, color = settings.liq_color, style = liq_line_style, width = settings.liq_width))
-
+            
             // C0 line: extend to current bar or stop at mitigation
             if not na(setup.liq_c0_price)
                 int c0_start_time = time[bar_index - setup.liq_c0_start_idx]
                 int c0_end_time = not na(setup.liq_c0_mitigated_idx) ? time[bar_index - setup.liq_c0_mitigated_idx] : time
-                bin.lines.push(line.new(c0_start_time, setup.liq_c0_price, c0_end_time, setup.liq_c0_price,
+                bin.lines.push(line.new(c0_start_time, setup.liq_c0_price, c0_end_time, setup.liq_c0_price, 
                     xloc = xloc.bar_time, color = settings.liq_color, style = liq_line_style, width = settings.liq_width))
-
+        
         // ==== LAYER 2: PROJECTIONS - SKIP if invalid ====
         if not setup.is_invalid and settings.proj_show and setup.cisd_triggered and not na(setup.proj_anchor_1) and not na(setup.proj_anchor_0)
             proj_line_style = LineStyle(settings.proj_style)
             proj_label_sz = LabelSize(settings.proj_label_size)
             float proj_range = setup.proj_anchor_1 - setup.proj_anchor_0
-
+            
             for dv = 0 to proj_deviations.size() - 1
                 dev = proj_deviations.get(dv)
                 float price = na
@@ -1766,28 +2255,28 @@ method DrawSetups(CandleSet candleSet) =>
                     price := setup.proj_anchor_0 - (math.abs(proj_range) * dev)
                 else
                     price := setup.proj_anchor_0 + (proj_range * dev)
-
-                bin.lines.push(line.new(setup.proj_start_idx, price, setup.proj_end_idx, price,
+                
+                bin.lines.push(line.new(setup.proj_start_idx, price, setup.proj_end_idx, price, 
                     color = settings.proj_color, style = proj_line_style, width = settings.proj_width))
-
+                
                 if settings.proj_label_show
-                    bin.labels.push(label.new(setup.proj_start_idx, price, str.tostring(dev),
-                        color = color_transparent, textcolor = settings.proj_color,
+                    bin.labels.push(label.new(setup.proj_start_idx, price, str.tostring(dev), 
+                        color = color_transparent, textcolor = settings.proj_color, 
                         style = label.style_label_right, size = proj_label_sz))
-
+        
         // ==== LAYER 3: C2 LABEL - show "xC2" in red if invalid ====
         if setup.is_confirmed or setup.cisd_triggered
             lbl_style = is_bull ? label.style_label_up : label.style_label_down
             string lbl_text = setup.is_invalid ? "xC2" : "C2"
             color lbl_color = setup.is_invalid ? color.red : settings.c2_color
             bin.labels.push(label.new(setup.c2_x, setup.c2_y, lbl_text, color = color_transparent, textcolor = lbl_color, style = lbl_style, size = settings.c2_size))
-
+        
         // ==== LAYER 4: SWEEP LINES (near top) - SKIP if invalid ====
         if not setup.is_invalid and settings.sweep_show
             // For post-C2 setups, use ltf_end_idx (locked at C3 start); for C2 phase, extend to current bar
             int sweep_end = setup.is_post_c2 ? setup.ltf_end_idx : bar_index
             bin.lines.push(line.new(setup.sweep_ltf_idx, setup.sweep_price, sweep_end, setup.sweep_price, color = settings.sweep_color, style = sweep_line_style, width = settings.sweep_size))
-
+        
         // Draw HTF sweep line - only when projection is visible, SKIP if invalid
         if not setup.is_invalid and not settings.hide_candles
             int htf_x1 = na
@@ -1800,40 +2289,107 @@ method DrawSetups(CandleSet candleSet) =>
             if not na(htf_x1) and not na(htf_x2)
                 if settings.sweep_show
                     bin.lines.push(line.new(htf_x1, setup.sweep_price, htf_x2, setup.sweep_price, color = settings.sweep_color, style = sweep_line_style, width = settings.sweep_size))
-
+        
         // ==== LAYER 5: CISD LINE (on top) - ALWAYS DRAW even if invalid ====
         if settings.cisd_show and setup.cisd_triggered and setup.has_cisd
             cisd_color = is_bull ? settings.cisd_bull_color : settings.cisd_bear_color
             bin.lines.push(line.new(setup.cisd_start_idx, setup.cisd_level, setup.cisd_end_idx + 1, setup.cisd_level, color = cisd_color, style = cisd_line_style, width = settings.cisd_width))
-
-        // ==== LAYER 6: POSITION SIZER BOXES (live setups) ====
-        if settings.ps_show and setup.cisd_triggered and not na(setup.ps_entry)
-            // Live setups: extend to current bar (will be capped at HTF end when completed)
-            int ps_end_x = bar_index
-
-            // Risk box (entry to stop)
-            if is_bull
-                bin.boxes.push(box.new(setup.ps_start_idx, setup.ps_entry, ps_end_x, setup.ps_stop, border_color = color.new(na, 100), bgcolor = settings.ps_risk_color))
-                bin.boxes.push(box.new(setup.ps_start_idx, setup.ps_target, ps_end_x, setup.ps_entry, border_color = color.new(na, 100), bgcolor = settings.ps_reward_color))
-            else
-                bin.boxes.push(box.new(setup.ps_start_idx, setup.ps_stop, ps_end_x, setup.ps_entry, border_color = color.new(na, 100), bgcolor = settings.ps_risk_color))
-                bin.boxes.push(box.new(setup.ps_start_idx, setup.ps_entry, ps_end_x, setup.ps_target, border_color = color.new(na, 100), bgcolor = settings.ps_reward_color))
-
+        
+        // ==== LAYER 5b: IC-CISD (confirmed only, live) ====
+        if settings.ic_cisd_show and not na(setup.ic_list) and setup.ic_list.size() > 0
+            color ic_col_l = is_bull ? settings.cisd_bull_color : settings.cisd_bear_color
+            for ic_j = 0 to setup.ic_list.size() - 1
+                ICCisd ic_l = setup.ic_list.get(ic_j)
+                if not na(ic_l.level) and not na(ic_l.start_idx) and not na(ic_l.end_idx)
+                    bin.lines.push(line.new(ic_l.start_idx, ic_l.level, ic_l.end_idx, ic_l.level, color = ic_col_l, style = cisd_line_style, width = settings.cisd_width))
+                if not na(ic_l.extreme_price) and not na(ic_l.extreme_idx)
+                    ic_dot_style_l = is_bull ? label.style_label_up : label.style_label_down
+                    bin.labels.push(label.new(ic_l.extreme_idx, ic_l.extreme_price, "●", color = color_transparent, textcolor = ic_col_l, style = ic_dot_style_l, size = size.tiny))
+        
+        // ==== LAYER 6: SMT LINE - SKIP if invalid ====
+        if not setup.is_invalid and smt_show_input and setup.has_smt and not na(setup.smt_x1) and not na(setup.smt_x2)
+            smt_line_style = LineStyle(smt_line_style_input)
+            // Draw line from prev high/low to current high/low
+            bin.lines.push(line.new(setup.smt_x1, setup.smt_y1, setup.smt_x2, setup.smt_y2, 
+                color = smt_color_input, style = smt_line_style, width = smt_line_width_input))
+            // Draw label at midpoint
+            if smt_label_show_input
+                int mid_x = math.round((setup.smt_x1 + setup.smt_x2) / 2)
+                float mid_y = (setup.smt_y1 + setup.smt_y2) / 2
+                lbl_style_smt = is_bull ? label.style_label_up : label.style_label_down
+                bin.labels.push(label.new(mid_x, mid_y, setup.smt_symbol, 
+                    color = color_transparent, textcolor = smt_color_input, 
+                    style = lbl_style_smt, size = LabelSize(smt_label_size_input)))
+        
+        // ==== LAYER 7: PREVIOUS EQ (chart) — after confirmed; C2 mid on C3, C3 mid on C4 ====
+        if not setup.is_invalid and setup.is_confirmed and ShowChartEQ()
+            eq_line_style_live = LineStyle(prev_eq_style)
+            // C2 EQ across C3 window
+            if not na(setup.c2_mid) and not na(setup.ez_c3_left_time)
+                int eq3_right_live = EntryZoneRight(setup.ez_c3_right_time)
+                if eq3_right_live > setup.ez_c3_left_time
+                    bin.lines.push(line.new(setup.ez_c3_left_time, setup.c2_mid, eq3_right_live, setup.c2_mid,
+                        xloc = xloc.bar_time, color = prev_eq_color, style = eq_line_style_live, width = prev_eq_width))
+            // C3 EQ across C4 window — if C4 invalid: stop at that LTF bar, red
+            if not na(setup.c3_mid) and not na(setup.ez_c4_left_time)
+                int eq4_right_live = setup.ez_c4_invalid and not na(setup.ez_c4_invalid_time) ? setup.ez_c4_invalid_time : EntryZoneRight(setup.ez_c4_right_time)
+                color eq4_col_live = setup.ez_c4_invalid ? color.red : prev_eq_color
+                if eq4_right_live > setup.ez_c4_left_time
+                    bin.lines.push(line.new(setup.ez_c4_left_time, setup.c3_mid, eq4_right_live, setup.c3_mid,
+                        xloc = xloc.bar_time, color = eq4_col_live, style = eq_line_style_live, width = prev_eq_width))
+        
+        // ==== LAYER 7b: PREVIOUS EQ (HTF projection) — live ====
+        if not setup.is_invalid and setup.is_confirmed and ShowHtfEQ() and not settings.hide_candles
+            int c2_i_live = FindCandleIndex(candleSet.candles, setup.htf_candle_idx)
+            eq_htf_style_live = LineStyle(prev_eq_style)
+            if not na(setup.c2_mid) and c2_i_live > 0
+                Candle c2_proj_l = candleSet.candles.get(c2_i_live)
+                Candle c3_proj_l = candleSet.candles.get(c2_i_live - 1)
+                int htf_eq3_x1_l = c2_proj_l.wick_x
+                int htf_eq3_x2_l = c3_proj_l.candle_right + 2
+                if htf_eq3_x2_l > htf_eq3_x1_l
+                    bin.lines.push(line.new(htf_eq3_x1_l, setup.c2_mid, htf_eq3_x2_l, setup.c2_mid,
+                        color = prev_eq_color, style = eq_htf_style_live, width = prev_eq_width))
+            if not na(setup.c3_mid) and c2_i_live > 1
+                Candle c3_proj4_l = candleSet.candles.get(c2_i_live - 1)
+                Candle c4_proj_l = candleSet.candles.get(c2_i_live - 2)
+                int htf_eq4_x1_l = c3_proj4_l.wick_x
+                int htf_eq4_x2_l = c4_proj_l.candle_right + 2
+                color htf_eq4_col_l = setup.ez_c4_invalid ? color.red : prev_eq_color
+                if htf_eq4_x2_l > htf_eq4_x1_l
+                    bin.lines.push(line.new(htf_eq4_x1_l, setup.c3_mid, htf_eq4_x2_l, setup.c3_mid,
+                        color = htf_eq4_col_l, style = eq_htf_style_live, width = prev_eq_width))
+        
+        // ==== LAYER 8: ENTRY ZONE C3 - SKIP if invalid ====
+        // Label: bearish = top-left of box (label_down), bullish = bottom-left (label_up) — same gap style as C2
+        // Zone right edge develops with LTF bars (option A), then locks at C3 end
+        if not setup.is_invalid and settings.entry_zone_show and setup.ez_c3_set and not na(setup.ez_c3_left_time)
+            color ez_col_live = is_bull ? settings.entry_zone_bull_color : settings.entry_zone_bear_color
+            int ez_right_live = EntryZoneRight(setup.ez_c3_right_time)
+            bin.boxes.push(box.new(setup.ez_c3_left_time, setup.ez_c3_top, ez_right_live, setup.ez_c3_bot,
+                xloc = xloc.bar_time, bgcolor = ez_col_live, border_color = color_transparent, border_width = 0))
+            float ez_lbl_y_live = is_bull ? setup.ez_c3_bot : setup.ez_c3_top
+            // One chart candle right of box left edge (same rule for C4 later)
+            int ez_lbl_x_live = setup.ez_c3_left_time + timeframe.in_seconds() * 1000
+            lbl_style_ez_live = is_bull ? label.style_label_up : label.style_label_down
+            bin.labels.push(label.new(ez_lbl_x_live, ez_lbl_y_live, "C3", xloc = xloc.bar_time,
+                color = color_transparent, textcolor = settings.c2_color, style = lbl_style_ez_live, size = settings.c2_size))
+        
     candleSet
 
 method DrawAll(CandleSet candleSet, int offset) =>
     // Always calculate positions (needed for HTF sweep line drawing)
     candleSet.CalculatePositions(offset)
-
+    
     // Always draw VT/HL lines (these are on the LTF chart, not the projection)
     candleSet.DrawVTHLLines()
-
+    
     // When hiding projection, skip candles/labels/trace
     if not settings.hide_candles
         candleSet.DrawCandles()
         candleSet.DrawLabels(offset)
         candleSet.DrawTrace(offset)
-
+    
     // Draw setups (projections, sweeps, CISD, liquidity) - skip if hide_setups enabled
     if not settings.hide_setups
         candleSet.DrawSetups()
@@ -1854,6 +2410,62 @@ prevQuarterlySession := currentQuarterlySession
 
 // Check if this is a new HTF candle (works for both timeframe-based and session-based modes)
 bool isNewHTFCandle = isQuarterlyMode() ? isNewQuarterlySession : ta.change(time(htf.settings.htf)) > 0
+
+// SMT Tracker updates - reset on new HTF candle, update high/low every bar
+if isNewHTFCandle and smt_show_input
+    // Store previous HTF candle values before resetting - CURRENT SYMBOL
+    smt_tracker_curr.prev_h := smt_tracker_curr.h
+    smt_tracker_curr.prev_l := smt_tracker_curr.l
+    smt_tracker_curr.prev_h_idx := smt_tracker_curr.h_idx
+    smt_tracker_curr.prev_l_idx := smt_tracker_curr.l_idx
+    smt_tracker_curr.h := high
+    smt_tracker_curr.l := low
+    smt_tracker_curr.h_idx := bar_index
+    smt_tracker_curr.l_idx := bar_index
+    
+    // COMPARISON SYMBOL 1
+    smt_tracker1.prev_h := smt_tracker1.h
+    smt_tracker1.prev_l := smt_tracker1.l
+    smt_tracker1.prev_h_idx := smt_tracker1.h_idx
+    smt_tracker1.prev_l_idx := smt_tracker1.l_idx
+    smt_tracker1.h := smt_sym1_h
+    smt_tracker1.l := smt_sym1_l
+    smt_tracker1.h_idx := bar_index
+    smt_tracker1.l_idx := bar_index
+    
+    // COMPARISON SYMBOL 2
+    smt_tracker2.prev_h := smt_tracker2.h
+    smt_tracker2.prev_l := smt_tracker2.l
+    smt_tracker2.prev_h_idx := smt_tracker2.h_idx
+    smt_tracker2.prev_l_idx := smt_tracker2.l_idx
+    smt_tracker2.h := smt_sym2_h
+    smt_tracker2.l := smt_sym2_l
+    smt_tracker2.h_idx := bar_index
+    smt_tracker2.l_idx := bar_index
+
+// Update running highs/lows for all symbols (every bar)
+if smt_show_input
+    // Current symbol
+    if high > smt_tracker_curr.h or na(smt_tracker_curr.h)
+        smt_tracker_curr.h := high
+        smt_tracker_curr.h_idx := bar_index
+    if low < smt_tracker_curr.l or na(smt_tracker_curr.l)
+        smt_tracker_curr.l := low
+        smt_tracker_curr.l_idx := bar_index
+    // Comparison symbol 1
+    if not na(smt_sym1_h) and (smt_sym1_h > smt_tracker1.h or na(smt_tracker1.h))
+        smt_tracker1.h := smt_sym1_h
+        smt_tracker1.h_idx := bar_index
+    if not na(smt_sym1_l) and (smt_sym1_l < smt_tracker1.l or na(smt_tracker1.l))
+        smt_tracker1.l := smt_sym1_l
+        smt_tracker1.l_idx := bar_index
+    // Comparison symbol 2
+    if not na(smt_sym2_h) and (smt_sym2_h > smt_tracker2.h or na(smt_tracker2.h))
+        smt_tracker2.h := smt_sym2_h
+        smt_tracker2.h_idx := bar_index
+    if not na(smt_sym2_l) and (smt_sym2_l < smt_tracker2.l or na(smt_tracker2.l))
+        smt_tracker2.l := smt_sym2_l
+        smt_tracker2.l_idx := bar_index
 
 // Determine if we should run Monitor:
 // - Always run when new HTF candle opens (for HTF candle creation, vertical lines, etc.)
