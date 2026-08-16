@@ -43,6 +43,7 @@ type ICCisd
     int end_idx
     float extreme_price
     int extreme_idx
+    bool taken               // wick beyond swing high/low — line and dot go grey
 
 type Setup
     bool is_bullish          // true = bullish setup (low sweep), false = bearish (high sweep)
@@ -63,11 +64,11 @@ type Setup
     // CISD data
     float cisd_level         // CISD price level (open of opposing candles)
     int cisd_start_idx       // bar index where CISD level starts
-    int cisd_end_idx         // bar index where CISD line ends (bar after trigger)
+    int cisd_end_idx         // body-break bar; line drawn to this + 1
     float tracked_extreme    // tracks high/low price for CISD (lowest low or highest high)
     int extreme_bar_idx      // bar index where the extreme occurred (for CISD traceback)
     bool has_cisd            // true when CISD level is set
-    bool cisd_triggered      // true when close crosses through CISD level
+    bool cisd_triggered      // true when CISD may show (body broke; in C2 also needs sweep back in)
     // IC-CISD (rebuild): opposite-candle open = level; body break confirms; one pending
     array<ICCisd> ic_list
     bool ic_active           // detection on after main CISD (through C4)
@@ -170,6 +171,9 @@ type Settings
     bool sweep_live
     color c2_color
     string c2_size
+    bool show_c2_lbl
+    bool show_c3_lbl
+    bool show_c4_lbl
     // CISD settings
     bool cisd_show
     color cisd_bull_color
@@ -177,6 +181,7 @@ type Settings
     int cisd_width
     string cisd_style
     bool ic_cisd_show        // IC-CISD toggle (same colors/width/style as CISD)
+    string ic_dot_size       // IC-CISD swing dot size
     // Entry Zone settings
     bool entry_zone_show
     color entry_zone_bull_color
@@ -267,7 +272,7 @@ var array<float> proj_deviations = array.new_float()
 
 string group_general            = "General Settings  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 string group_htf               = "HTF Candles  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-string group_sweep              = "Sweeps ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+string group_sweep              = "Model Settings  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 string group_label              = "Label Settings  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 string group_imbalance          = "Imbalance  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -583,20 +588,24 @@ settings.live_alerts_enabled    := input.bool(true, 'Alert', inline='sweep_live'
 settings.sweep_color            := input.color(color.rgb(0, 0, 0, 0), 'Color         ', inline='sweep_color', group=group_sweep, active = sweep_show_input)
 settings.sweep_style            := input.string('Solid', '', options=['Solid', 'Dashed', 'Dotted'], inline='sweep_color', group=group_sweep, active = sweep_show_input)
 settings.sweep_size             := input.int(1, '', options=[1, 2, 3, 4], inline='sweep_color', group=group_sweep, active = sweep_show_input)
-settings.c2_color               := input.color(color.rgb(0, 0, 0), 'C2 Label      ', inline='c2', group=group_sweep)
+settings.c2_color               := input.color(color.rgb(0, 0, 0), 'Label      ', inline='c2', group=group_sweep)
 settings.c2_size                := input.string(size.small, '', options=[size.tiny, size.small, size.normal, size.large], inline='c2', group=group_sweep)
+settings.show_c2_lbl            := input.bool(true, 'C2', inline='c2', group=group_sweep)
+settings.show_c3_lbl            := input.bool(true, 'C3', inline='c2', group=group_sweep)
+settings.show_c4_lbl            := input.bool(true, 'C4', inline='c2', group=group_sweep)
 cisd_show_input                 = input.bool(true, 'Show CISD     ', inline='cisd', group=group_sweep)
 settings.cisd_show              := cisd_show_input
-ic_cisd_show_input              = input.bool(false, 'IC-CISD', inline='cisd', group=group_sweep, tooltip='Same-side IC-CISD after main CISD confirm through C4 (stops on setup or C4 invalid). Uses CISD colors/width/style. Extreme marked with a dot.')
+ic_cisd_show_input              = input.bool(true, 'IC-CISD', inline='cisd', group=group_sweep, tooltip='Same-side IC-CISD after main CISD confirm through C4 (stops on setup or C4 invalid). Uses CISD colors/width/style. Extreme marked with a dot.')
 settings.ic_cisd_show           := ic_cisd_show_input
+settings.ic_dot_size            := input.string(size.tiny, 'Dot', options=[size.tiny, size.small, size.normal, size.large], inline='cisd', group=group_sweep, active = ic_cisd_show_input)
 settings.cisd_bull_color        := input.color(color.rgb(41,98,255), 'Bull          ', inline='cisd_color', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
 settings.cisd_bear_color        := input.color(color.rgb(242,54,69), 'Bear', inline='cisd_color', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
 settings.cisd_width             := input.int(2, 'Width', options=[1, 2, 3, 4], inline='cisd_style', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
 settings.cisd_style             := input.string('Solid', 'Style', options=['Solid', 'Dashed', 'Dotted'], inline='cisd_style', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
 entry_zone_show_input           = input.bool(true, 'Entry Zone   ', inline='entry_zone', group=group_sweep)
 settings.entry_zone_show        := entry_zone_show_input
-settings.entry_zone_bull_color  := input.color(color.new(color.rgb(41, 98, 255), 85), 'Bullish', inline='entry_zone', group=group_sweep, active = entry_zone_show_input)
-settings.entry_zone_bear_color  := input.color(color.new(color.rgb(242, 54, 69), 85), 'Bearish', inline='entry_zone', group=group_sweep, active = entry_zone_show_input)
+settings.entry_zone_bull_color  := input.color(color.new(color.rgb(41, 98, 255), 94), 'Bullish', inline='entry_zone', group=group_sweep, active = entry_zone_show_input)
+settings.entry_zone_bear_color  := input.color(color.new(color.rgb(242, 54, 69), 94), 'Bearish', inline='entry_zone', group=group_sweep, active = entry_zone_show_input)
 
 // Standard Deviation Projections
 string group_projection         = "Standard Deviation Projections  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -621,21 +630,21 @@ if proj_deviations.size() == 0
 
 // Formation Liquidity
 string group_liquidity          = "Formation Liquidity  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-liq_show_input                  = input.bool(true, 'Enable Formation Liquidity?', group=group_liquidity)
+liq_show_input                  = input.bool(true, 'Enable', inline='liq_style', group=group_liquidity)
 settings.liq_show               := liq_show_input
 settings.liq_color              := input.color(color.rgb(0, 0, 0), '', inline='liq_style', group=group_liquidity, active = liq_show_input)
 settings.liq_style              := input.string('Dotted', '', options=['Solid', 'Dashed', 'Dotted'], inline='liq_style', group=group_liquidity, active = liq_show_input)
-settings.liq_width              := input.int(1, 'Width', inline='liq_style', group=group_liquidity, active = liq_show_input)
+settings.liq_width              := input.int(1, 'Width', options=[1, 2, 3, 4], inline='liq_style', group=group_liquidity, active = liq_show_input)
 
 // SMT Divergence
 string group_smt                = "SMT Divergence  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-smt_show_input                  = input.bool(true, 'Enable SMT?', inline='smt_enable', group=group_smt)
-smt_alerts_input                = input.bool(true, 'Alerts?', inline='smt_enable', group=group_smt)
-smt_label_show_input            = input.bool(true, 'Labels?', inline='smt_labels', group=group_smt, active = smt_show_input)
-smt_label_size_input            = input.string('Small', '', options=['Tiny', 'Small', 'Normal', 'Large'], inline='smt_labels', group=group_smt, active = smt_show_input and smt_label_show_input)
-smt_line_style_input            = input.string('Solid', '', options=['Solid', 'Dashed', 'Dotted'], inline='smt_style', group=group_smt, active = smt_show_input)
-smt_line_width_input            = input.int(1, 'Width', options=[1, 2, 3, 4], inline='smt_style', group=group_smt, active = smt_show_input)
-smt_color_input                 = input.color(color.rgb(156, 39, 176), '', inline='smt_color', group=group_smt, active = smt_show_input)
+smt_show_input                  = input.bool(true, 'SMT', inline='smt_top', group=group_smt)
+smt_label_show_input            = input.bool(true, 'Label', inline='smt_top', group=group_smt, active = smt_show_input)
+smt_label_size_input            = input.string('Small', '', options=['Tiny', 'Small', 'Normal', 'Large'], inline='smt_top', group=group_smt, active = smt_show_input and smt_label_show_input)
+smt_alerts_input                = input.bool(true, 'Alerts', inline='smt_top', group=group_smt, active = smt_show_input)
+smt_color_input                 = input.color(color.rgb(156, 39, 176), '', inline='smt_line', group=group_smt, active = smt_show_input)
+smt_line_style_input            = input.string('Solid', '', options=['Solid', 'Dashed', 'Dotted'], inline='smt_line', group=group_smt, active = smt_show_input)
+smt_line_width_input            = input.int(1, 'Width', options=[1, 2, 3, 4], inline='smt_line', group=group_smt, active = smt_show_input)
 smt_mode_input                  = input.string('Automatic', 'SMT Mode', options=['Automatic', 'Manual'], inline='smt_mode', group=group_smt, active = smt_show_input)
 smt_sym2_enable_input           = input.bool(true, 'Enable Second SMT?', inline='smt_mode', group=group_smt, active = smt_show_input)
 // Symbol 1
@@ -670,8 +679,7 @@ htf_label_show_input            = input.bool(true, 'HTF Label     ', group=group
 settings.htf_label_show         := htf_label_show_input
 settings.htf_label_color        := input.color(color.rgb(0, 0, 0), '', group=group_label, inline = 'HTFlabel', active = htf_label_show_input)
 settings.htf_label_size         := input.string(size.large, '', [size.tiny, size.small, size.normal, size.large, size.huge], group=group_label, inline = 'HTFlabel', active = htf_label_show_input)
-
-settings.label_position         := input.string("Top", 'Label Position ', options=['Both', 'Top', 'Bottom'], group=group_label, active = htf_label_show_input)
+settings.label_position         := input.string("Top", 'Pos', options=['Both', 'Top', 'Bottom'], group=group_label, inline = 'HTFlabel', active = htf_label_show_input)
 
 htf_timer_show_input            = input.bool(true, 'Remaining Time', inline = 'timer', group=group_label,active = htf_label_show_input)
 settings.htf_timer_show         := htf_timer_show_input
@@ -682,7 +690,7 @@ daily_name_input                = input.bool(true, 'Interval Value', group=group
 settings.daily_name             := daily_name_input
 settings.dow_color              := input.color(color.rgb(0, 0, 0), '', group=group_label, inline = 'dow', active = daily_name_input)
 settings.dow_size               := input.string(size.small, '', [size.tiny, size.small, size.normal, size.large, size.huge], group=group_label, inline = 'dow', active = daily_name_input)
-settings.dow_position           := input.string('Bottom', 'Interval Position', options=['Both', 'Top', 'Bottom'], group=group_label, active = daily_name_input)
+settings.dow_position           := input.string('Bottom', 'Pos', options=['Both', 'Top', 'Bottom'], group=group_label, inline = 'dow', active = daily_name_input)
 
 fvg_show_input                  = input.bool(true, 'Fair Value Gap', group = group_imbalance, inline = 'fvg')
 settings.fvg_show               := fvg_show_input
@@ -787,13 +795,13 @@ LTFName() =>
         result := str.tostring(seconds / 3600) + 'H'
     result
 
-// Build alert message: "LTF-HTF TICKER: [Potential] Bullish/Bearish Candle 2"
-BuildAlertMessage(string htf, bool is_bullish, bool is_potential) =>
+// Build alert message: "LTF-HTF TICKER: [Potential] Bullish/Bearish <name>"
+BuildAlertMessage(string htf, bool is_bullish, bool is_potential, string name) =>
     string ltf = LTFName()
     string htf_name = HTFName(htf)
     string direction = is_bullish ? "Bullish" : "Bearish"
     string potential = is_potential ? "Potential " : ""
-    str.format("{0}-{1} {2}: {3}{4} Candle 2", ltf, htf_name, syminfo.ticker, potential, direction)
+    str.format("{0}-{1} {2}: {3}{4} {5}", ltf, htf_name, syminfo.ticker, potential, direction, name)
 
 CandleSetHigh(array<Candle> candles, float h) =>
     float _h = h
@@ -912,11 +920,12 @@ FindCISDLevel(int extreme_bar_idx, int bias) =>
     [cisd_price, cisd_idx]
 
 // ——— IC-CISD (rebuild) ———
-// - Level = open of starting opposite candle; stays until proper shift or confirm
-// - Shift only: opposite → same-side (not doji) → new opposite that takes structure extreme
-// - Start bar may be swing middle; confirm on later body break
-// - Dot extreme updates every bar; on confirm keep highest high / lowest low
-// - Next arm only if new structure can exceed last confirmed IC extreme (reduces rapid tiny ICs)
+// - Level = open of the starting opposite candle; does not move onto later same-side candles
+// - Confirm on later body break through that open
+// - Mark only if a 3-candle swing exists (middle beyond both neighbors). Start may be that middle; close-through may be the right.
+// - Dot = highest swing wick (bear) / lowest swing wick (bull) among those middles
+// - Calculate from the bar after main CISD body-break; draw only after sweep-back-in / show
+// - After confirm, next opposite candle starts another IC (lower or higher swing does not matter)
 
 ICHardStop(Setup setup) =>
     setup.is_invalid or setup.ez_c4_invalid or (not na(setup.ez_c4_right_time) and time >= setup.ez_c4_right_time)
@@ -956,13 +965,61 @@ ICTrackExtreme(Setup setup) =>
             setup.ic_extreme_idx := bar_index
     setup
 
+// 3-candle swing: middle beyond both neighbors. Start may be middle; end (confirm) may be right.
+// Returns [swing price, swing bar] or [na, na]. Bear = highest such high; bull = lowest such low.
+ICFindSwing(Setup setup, int end_idx) =>
+    float best_px = na
+    int best_idx = na
+    int start = setup.ic_start_idx
+    if not na(start) and not na(end_idx) and end_idx > start
+        for m = start to end_idx - 1
+            if m < 1
+                continue
+            int off_m = bar_index - m
+            int off_l = bar_index - (m - 1)
+            int off_r = bar_index - (m + 1)
+            if off_m < 0 or off_l < 0 or off_r < 0
+                continue
+            if setup.is_bullish
+                if low[off_m] < low[off_l] and low[off_m] < low[off_r]
+                    if na(best_px) or low[off_m] < best_px
+                        best_px := low[off_m]
+                        best_idx := m
+            else
+                if high[off_m] > high[off_l] and high[off_m] > high[off_r]
+                    if na(best_px) or high[off_m] > best_px
+                        best_px := high[off_m]
+                        best_idx := m
+    [best_px, best_idx]
+
+// Wick beyond a stored IC swing: bear above the high, bull below the low
+ICMarkTaken(Setup setup) =>
+    if ICHardStop(setup)
+        setup
+    else if not na(setup.ic_list) and setup.ic_list.size() > 0
+        for i = 0 to setup.ic_list.size() - 1
+            ICCisd ic = setup.ic_list.get(i)
+            if not ic.taken and not na(ic.extreme_price)
+                if setup.is_bullish
+                    if low < ic.extreme_price
+                        ic.taken := true
+                else
+                    if high > ic.extreme_price
+                        ic.taken := true
+    setup
+
 ICUpdate(Setup setup) =>
+    ICMarkTaken(setup)
     if not settings.ic_cisd_show
+        setup
+    else if not barstate.isconfirmed
+        // Live bar color can flip; never arm or move the level until the candle is closed
         setup
     else if ICHardStop(setup)
         StopICDetection(setup)
         setup
-    else if not setup.cisd_triggered or na(setup.cisd_end_idx)
+    else if na(setup.cisd_end_idx)
+        // Calculate from CISD body-break, even before sweep-back-in / show
         if not setup.is_invalid and (setup.ic_active or setup.ic_pending)
             ResetICCisd(setup)
         else
@@ -980,59 +1037,50 @@ ICUpdate(Setup setup) =>
                 setup.ic_list := array.new<ICCisd>()
             ClearICPending(setup)
 
-        // Strict color: doji is neither (must not unlock shift)
+        // Strict color: doji is neither opposite nor same-side
         bool opp_bar = setup.is_bullish ? (close < open) : (close > open)
-        bool same_bar = setup.is_bullish ? (close > open) : (close < open)
 
         if setup.ic_pending
-            // Always refresh structure extreme for the dot
-            ICTrackExtreme(setup)
-
-            if same_bar
-                // Real same-side only (bearish on bearish setup) — unlocks a later shift
-                setup.ic_seen_same_side := true
-            else if opp_bar
-                // Shift only after same-side was seen, then new opposite takes extreme
-                // Consecutive opposite (2nd bullish, etc.): NEVER shift level — keep start open
-                bool takes_ext = setup.is_bullish ? (low <= setup.ic_extreme) : (high >= setup.ic_extreme)
-                if setup.ic_seen_same_side and takes_ext
-                    // Proper shift: new opposite after same-side, takes swing high/low
-                    setup.ic_level := open
-                    setup.ic_start_idx := bar_index
-                    setup.ic_extreme := setup.is_bullish ? low : high
-                    setup.ic_extreme_idx := bar_index
-                    setup.ic_seen_same_side := false
-                // else: keep original level (start candle open); extreme already tracked
-
             // Body break (start may be swing middle; right candle confirms next bar+)
             if bar_index > setup.ic_start_idx
                 bool broke = setup.is_bullish ? (close > setup.ic_level) : (close < setup.ic_level)
+                [sw_px, sw_idx] = ICFindSwing(setup, bar_index)
                 if broke
-                    ICCisd ic = ICCisd.new()
-                    ic.level := setup.ic_level
-                    ic.start_idx := setup.ic_start_idx
-                    ic.end_idx := bar_index
-                    ic.extreme_price := setup.ic_extreme
-                    ic.extreme_idx := setup.ic_extreme_idx
-                    if na(setup.ic_list)
-                        setup.ic_list := array.new<ICCisd>()
-                    array.push(setup.ic_list, ic)
-                    setup.ic_last_extreme := setup.ic_extreme
-                    ClearICPending(setup)
+                    if not na(sw_px) and not na(sw_idx)
+                        ICCisd ic = ICCisd.new()
+                        ic.level := setup.ic_level
+                        ic.start_idx := setup.ic_start_idx
+                        ic.end_idx := bar_index
+                        ic.extreme_price := sw_px
+                        ic.extreme_idx := sw_idx
+                        if na(setup.ic_list)
+                            setup.ic_list := array.new<ICCisd>()
+                        array.push(setup.ic_list, ic)
+                        setup.ic_last_extreme := sw_px
+                        ClearICPending(setup)
+                        if settings.alerts_enabled and settings.ic_cisd_show and (settings.bias == "Neutral" or (setup.is_bullish and settings.bias == "Bullish") or (not setup.is_bullish and settings.bias == "Bearish"))
+                            alert(BuildAlertMessage(htf.settings.htf, setup.is_bullish, false, "IC-CISD"), alert.freq_once_per_bar)
+                    else
+                        // No swing yet. Keep only if this close-through made a new extreme (it may be the swing; next bar is the right).
+                        bool new_ext = setup.is_bullish ? (low < setup.ic_extreme) : (high > setup.ic_extreme)
+                        if new_ext
+                            ICTrackExtreme(setup)
+                        else
+                            ClearICPending(setup)
+                else
+                    ICTrackExtreme(setup)
+            else
+                ICTrackExtreme(setup)
         else
-            // Free: arm on opposite candle only if it can make a higher-high / lower-low vs last IC
-            // (start may be middle of swing; reduces right+1 / right+2 spam)
+            // Free: next opposite candle starts a new IC (HH/LH or LL/HL does not matter)
             if opp_bar
-                float bar_ext = setup.is_bullish ? low : high
-                bool better = na(setup.ic_last_extreme) or (setup.is_bullish ? bar_ext < setup.ic_last_extreme : bar_ext > setup.ic_last_extreme)
-                if better
-                    setup.ic_pending := true
-                    setup.ic_level := open
-                    setup.ic_start_idx := bar_index
-                    setup.ic_extreme := bar_ext
-                    setup.ic_extreme_idx := bar_index
-                    setup.ic_seen_same_side := false
-    setup
+                setup.ic_pending := true
+                setup.ic_level := open
+                setup.ic_start_idx := bar_index
+                setup.ic_extreme := setup.is_bullish ? low : high
+                setup.ic_extreme_idx := bar_index
+                setup.ic_seen_same_side := false
+        setup
 
 // ============================================================================
 // SMT Detection Helper
@@ -1181,6 +1229,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
 
         // ===== MITIGATION + C4 ENTRY ZONE INVALIDATION FOR CONFIRMED SETUPS =====
         for [i, setup] in candleSet.setups
+            ICMarkTaken(setup)
             // Only check mitigation if setup is still within C4 window
             if setup.cisd_triggered and not na(setup.liq_end_time) and time < setup.liq_end_time
                 if setup.is_bullish
@@ -1191,8 +1240,8 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     if not na(setup.liq_c0_price) and na(setup.liq_c0_mitigated_idx)
                         if high >= setup.liq_c0_price
                             setup.liq_c0_mitigated_idx := bar_index
-                    // C4 invalidation (after C3 complete): beyond C3 low — stop EQ + drop zone
-                    if not setup.ez_c4_invalid and not na(setup.c3_extreme) and not na(setup.ez_c4_left_time) and low < setup.c3_extreme
+                    // C4 invalidation (C4 window only): beyond C3 low — stop EQ + drop zone
+                    if not setup.ez_c4_invalid and not na(setup.c3_extreme) and not na(setup.ez_c4_left_time) and not na(setup.ez_c4_right_time) and time < setup.ez_c4_right_time and low < setup.c3_extreme
                         setup.ez_c4_invalid := true
                         setup.ez_c4_invalid_time := time_close
                 else
@@ -1203,8 +1252,8 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                     if not na(setup.liq_c0_price) and na(setup.liq_c0_mitigated_idx)
                         if low <= setup.liq_c0_price
                             setup.liq_c0_mitigated_idx := bar_index
-                    // C4 invalidation (after C3 complete): beyond C3 high — stop EQ + drop zone
-                    if not setup.ez_c4_invalid and not na(setup.c3_extreme) and not na(setup.ez_c4_left_time) and high > setup.c3_extreme
+                    // C4 invalidation (C4 window only): beyond C3 high — stop EQ + drop zone
+                    if not setup.ez_c4_invalid and not na(setup.c3_extreme) and not na(setup.ez_c4_left_time) and not na(setup.ez_c4_right_time) and time < setup.ez_c4_right_time and high > setup.c3_extreme
                         setup.ez_c4_invalid := true
                         setup.ez_c4_invalid_time := time_close
                 ICUpdate(setup)
@@ -1269,6 +1318,8 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.smt_x2 := setup.extreme_bar_idx  // C2's running high bar
                         setup.smt_y2 := setup.tracked_extreme  // C2's running high price
                         setup.smt_symbol := sym_name
+                        if settings.alerts_enabled and smt_alerts_input and (settings.bias == "Neutral" or settings.bias == "Bearish")
+                            alert(BuildAlertMessage(candleSet.settings.htf, false, false, "SMT"), alert.freq_once_per_bar)
                 candleSet.live_bearish := setup
                 candleSet.has_live_bearish := true
         else
@@ -1296,29 +1347,29 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.cisd_start_idx := new_cisd_idx
                         setup.has_cisd := true
                         setup.cisd_triggered := false  // Reset trigger on new extreme
+                        setup.cisd_end_idx := na
                         ResetICCisd(setup)  // IC must wait for new main CISD confirm
                 
-                // CISD trigger detection (only when sweep is confirmed)
-                if setup.is_confirmed and setup.has_cisd and not setup.cisd_triggered
-                    if close < setup.cisd_level
-                        setup.cisd_triggered := true
-                        setup.cisd_end_idx := bar_index
-                        // Capture projection data immediately so projections show when CISD forms
-                        int cisd_lookback = bar_index - setup.cisd_start_idx
-                        setup.proj_start_idx := setup.cisd_start_idx
-                        setup.proj_end_idx := setup.extreme_bar_idx + 1  // End 1 bar after swing point
-                        if settings.proj_type == "Wick"
-                            setup.proj_anchor_1 := setup.tracked_extreme        // Swing high
-                            setup.proj_anchor_0 := low[cisd_lookback]            // CISD source candle's low
-                        else
-                            // Body mode - use CISD source candle's body
-                            int extreme_lookback = bar_index - setup.extreme_bar_idx
-                            setup.proj_anchor_1 := math.max(open[extreme_lookback], close[extreme_lookback])
-                            setup.proj_anchor_0 := math.min(open[cisd_lookback], close[cisd_lookback])
-                        // Live/Potential alert for bearish CISD trigger
-                        if settings.live_alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
-                            alert(BuildAlertMessage(candleSet.settings.htf, false, true), alert.freq_once_per_bar)
-                        ResetICCisd(setup)  // clean slate; IC starts next LTF after this confirm
+                // Body break = CISD line end. Show / IC / alerts wait until sweep is also back in.
+                if setup.has_cisd and na(setup.cisd_end_idx) and close < setup.cisd_level
+                    setup.cisd_end_idx := bar_index
+                if setup.is_confirmed and setup.has_cisd and not setup.cisd_triggered and not na(setup.cisd_end_idx)
+                    setup.cisd_triggered := true
+                    // Capture projection data immediately so projections show when CISD forms
+                    int cisd_lookback = bar_index - setup.cisd_start_idx
+                    setup.proj_start_idx := setup.cisd_start_idx
+                    setup.proj_end_idx := setup.extreme_bar_idx + 1  // End 1 bar after swing point
+                    if settings.proj_type == "Wick"
+                        setup.proj_anchor_1 := setup.tracked_extreme        // Swing high
+                        setup.proj_anchor_0 := low[cisd_lookback]            // CISD source candle's low
+                    else
+                        // Body mode - use CISD source candle's body
+                        int extreme_lookback = bar_index - setup.extreme_bar_idx
+                        setup.proj_anchor_1 := math.max(open[extreme_lookback], close[extreme_lookback])
+                        setup.proj_anchor_0 := math.min(open[cisd_lookback], close[cisd_lookback])
+                    // Live/Potential alert for bearish CISD trigger
+                    if settings.live_alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
+                        alert(BuildAlertMessage(candleSet.settings.htf, false, true, "Candle 2"), alert.freq_once_per_bar)
                 
                 // Liquidity mitigation check (bearish: price crosses DOWN through liq level)
                 if not na(setup.liq_c1_price) and na(setup.liq_c1_mitigated_idx)
@@ -1438,7 +1489,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         TrySetEntryZoneC3(setup)
                         // Confirmed alert for bearish CISD trigger (post-C2 = already confirmed)
                         if settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
-                            alert(BuildAlertMessage(candleSet.settings.htf, false, false), alert.freq_once_per_bar)
+                            alert(BuildAlertMessage(candleSet.settings.htf, false, false, "Candle 2"), alert.freq_once_per_bar)
                 if not setup_replaced
                     ICUpdate(setup)
 
@@ -1502,6 +1553,8 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.smt_x2 := setup.extreme_bar_idx  // C2's running low bar
                         setup.smt_y2 := setup.tracked_extreme  // C2's running low price
                         setup.smt_symbol := sym_name
+                        if settings.alerts_enabled and smt_alerts_input and (settings.bias == "Neutral" or settings.bias == "Bullish")
+                            alert(BuildAlertMessage(candleSet.settings.htf, true, false, "SMT"), alert.freq_once_per_bar)
                 candleSet.live_bullish := setup
                 candleSet.has_live_bullish := true
         else
@@ -1529,29 +1582,29 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.cisd_start_idx := new_cisd_idx
                         setup.has_cisd := true
                         setup.cisd_triggered := false  // Reset trigger on new extreme
+                        setup.cisd_end_idx := na
                         ResetICCisd(setup)  // IC must wait for new main CISD confirm
                 
-                // CISD trigger detection (only when sweep is confirmed)
-                if setup.is_confirmed and setup.has_cisd and not setup.cisd_triggered
-                    if close > setup.cisd_level
-                        setup.cisd_triggered := true
-                        setup.cisd_end_idx := bar_index
-                        // Capture projection data immediately so projections show when CISD forms
-                        int cisd_lookback = bar_index - setup.cisd_start_idx
-                        setup.proj_start_idx := setup.cisd_start_idx
-                        setup.proj_end_idx := setup.extreme_bar_idx + 1  // End 1 bar after swing point
-                        if settings.proj_type == "Wick"
-                            setup.proj_anchor_1 := setup.tracked_extreme        // Swing low
-                            setup.proj_anchor_0 := high[cisd_lookback]           // CISD source candle's high
-                        else
-                            // Body mode - use CISD source candle's body
-                            int extreme_lookback = bar_index - setup.extreme_bar_idx
-                            setup.proj_anchor_1 := math.min(open[extreme_lookback], close[extreme_lookback])
-                            setup.proj_anchor_0 := math.max(open[cisd_lookback], close[cisd_lookback])
-                        // Live/Potential alert for bullish CISD trigger
-                        if settings.live_alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
-                            alert(BuildAlertMessage(candleSet.settings.htf, true, true), alert.freq_once_per_bar)
-                        ResetICCisd(setup)  // clean slate; IC starts next LTF after this confirm
+                // Body break = CISD line end. Show / IC / alerts wait until sweep is also back in.
+                if setup.has_cisd and na(setup.cisd_end_idx) and close > setup.cisd_level
+                    setup.cisd_end_idx := bar_index
+                if setup.is_confirmed and setup.has_cisd and not setup.cisd_triggered and not na(setup.cisd_end_idx)
+                    setup.cisd_triggered := true
+                    // Capture projection data immediately so projections show when CISD forms
+                    int cisd_lookback = bar_index - setup.cisd_start_idx
+                    setup.proj_start_idx := setup.cisd_start_idx
+                    setup.proj_end_idx := setup.extreme_bar_idx + 1  // End 1 bar after swing point
+                    if settings.proj_type == "Wick"
+                        setup.proj_anchor_1 := setup.tracked_extreme        // Swing low
+                        setup.proj_anchor_0 := high[cisd_lookback]           // CISD source candle's high
+                    else
+                        // Body mode - use CISD source candle's body
+                        int extreme_lookback = bar_index - setup.extreme_bar_idx
+                        setup.proj_anchor_1 := math.min(open[extreme_lookback], close[extreme_lookback])
+                        setup.proj_anchor_0 := math.max(open[cisd_lookback], close[cisd_lookback])
+                    // Live/Potential alert for bullish CISD trigger
+                    if settings.live_alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
+                        alert(BuildAlertMessage(candleSet.settings.htf, true, true, "Candle 2"), alert.freq_once_per_bar)
                 
                 // Liquidity mitigation check (bullish: price crosses UP through liq level)
                 if not na(setup.liq_c1_price) and na(setup.liq_c1_mitigated_idx)
@@ -1671,7 +1724,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         TrySetEntryZoneC3(setup)
                         // Confirmed alert for bullish CISD trigger (post-C2 = already confirmed)
                         if settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
-                            alert(BuildAlertMessage(candleSet.settings.htf, true, false), alert.freq_once_per_bar)
+                            alert(BuildAlertMessage(candleSet.settings.htf, true, false, "Candle 2"), alert.freq_once_per_bar)
                 if not setup_replaced
                     ICUpdate(setup)
 
@@ -1704,7 +1757,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         // to check for invalidation during C3. Will push to history at C3 close.
                         // Confirmed alert if CISD already triggered during C2
                         if setup.cisd_triggered and settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
-                            alert(BuildAlertMessage(candleSet.settings.htf, false, false), alert.freq_once_per_bar)
+                            alert(BuildAlertMessage(candleSet.settings.htf, false, false, "Candle 2"), alert.freq_once_per_bar)
                     else
                         // Sweep not confirmed at C2 close - remove
                         candleSet.has_live_bearish := false
@@ -1760,7 +1813,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         // to check for invalidation during C3. Will push to history at C3 close.
                         // Confirmed alert if CISD already triggered during C2
                         if setup.cisd_triggered and settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
-                            alert(BuildAlertMessage(candleSet.settings.htf, true, false), alert.freq_once_per_bar)
+                            alert(BuildAlertMessage(candleSet.settings.htf, true, false, "Candle 2"), alert.freq_once_per_bar)
                     else
                         // Sweep not confirmed at C2 close - remove
                         candleSet.has_live_bullish := false
@@ -2087,10 +2140,11 @@ method DrawSetups(CandleSet candleSet) =>
                                 style = label.style_label_right, size = proj_label_sz))
                 
                 // ==== LAYER 3: C2 LABEL - show "xC2" in red if invalid ====
-                lbl_style = setup.is_bullish ? label.style_label_up : label.style_label_down
-                string lbl_text = setup.is_invalid ? "xC2" : "C2"
-                color lbl_color = setup.is_invalid ? color.red : settings.c2_color
-                bin.labels.push(label.new(setup.c2_x, setup.c2_y, lbl_text, color = color_transparent, textcolor = lbl_color, style = lbl_style, size = settings.c2_size))
+                if settings.show_c2_lbl
+                    lbl_style = setup.is_bullish ? label.style_label_up : label.style_label_down
+                    string lbl_text = setup.is_invalid ? "xC2" : "C2"
+                    color lbl_color = setup.is_invalid ? color.red : settings.c2_color
+                    bin.labels.push(label.new(setup.c2_x, setup.c2_y, lbl_text, color = color_transparent, textcolor = lbl_color, style = lbl_style, size = settings.c2_size))
                 
                 // ==== LAYER 4: SWEEP LINES (near top) - SKIP if invalid ====
                 if not setup.is_invalid and settings.sweep_show
@@ -2115,16 +2169,16 @@ method DrawSetups(CandleSet candleSet) =>
                     // Extend 1 bar beyond trigger
                     bin.lines.push(line.new(setup.cisd_start_idx, setup.cisd_level, setup.cisd_end_idx + 1, setup.cisd_level, color = cisd_color, style = cisd_line_style, width = settings.cisd_width))
                 
-                // ==== LAYER 5b: IC-CISD (confirmed only) ====
-                if settings.ic_cisd_show and not na(setup.ic_list) and setup.ic_list.size() > 0
-                    color ic_col = setup.is_bullish ? settings.cisd_bull_color : settings.cisd_bear_color
+                // ==== LAYER 5b: IC-CISD (draw only after sweep-back-in / show) ====
+                if settings.ic_cisd_show and setup.cisd_triggered and not na(setup.ic_list) and setup.ic_list.size() > 0
                     for ic_i = 0 to setup.ic_list.size() - 1
                         ICCisd ic = setup.ic_list.get(ic_i)
+                        color ic_col = ic.taken ? color.gray : (setup.is_bullish ? settings.cisd_bull_color : settings.cisd_bear_color)
                         if not na(ic.level) and not na(ic.start_idx) and not na(ic.end_idx)
                             bin.lines.push(line.new(ic.start_idx, ic.level, ic.end_idx, ic.level, color = ic_col, style = cisd_line_style, width = settings.cisd_width))
                         if not na(ic.extreme_price) and not na(ic.extreme_idx)
                             ic_dot_style = setup.is_bullish ? label.style_label_up : label.style_label_down
-                            bin.labels.push(label.new(ic.extreme_idx, ic.extreme_price, "●", color = color_transparent, textcolor = ic_col, style = ic_dot_style, size = size.tiny))
+                            bin.labels.push(label.new(ic.extreme_idx, ic.extreme_price, "●", color = color_transparent, textcolor = ic_col, style = ic_dot_style, size = settings.ic_dot_size))
                 
                 // ==== LAYER 6: SMT LINE - SKIP if invalid ====
                 if not setup.is_invalid and smt_show_input and setup.has_smt and not na(setup.smt_x1) and not na(setup.smt_x2)
@@ -2190,11 +2244,12 @@ method DrawSetups(CandleSet candleSet) =>
                     int ez_right = EntryZoneRight(setup.ez_c3_right_time)
                     bin.boxes.push(box.new(setup.ez_c3_left_time, setup.ez_c3_top, ez_right, setup.ez_c3_bot,
                         xloc = xloc.bar_time, bgcolor = ez_col, border_color = color_transparent, border_width = 0))
-                    float ez_lbl_y = setup.is_bullish ? setup.ez_c3_bot : setup.ez_c3_top
-                    int ez_lbl_x = setup.ez_c3_left_time + timeframe.in_seconds() * 1000
-                    lbl_style_ez = setup.is_bullish ? label.style_label_up : label.style_label_down
-                    bin.labels.push(label.new(ez_lbl_x, ez_lbl_y, "C3", xloc = xloc.bar_time,
-                        color = color_transparent, textcolor = settings.c2_color, style = lbl_style_ez, size = settings.c2_size))
+                    if settings.show_c3_lbl
+                        float ez_lbl_y = setup.is_bullish ? setup.ez_c3_bot : setup.ez_c3_top
+                        int ez_lbl_x = setup.ez_c3_left_time + timeframe.in_seconds() * 1000
+                        lbl_style_ez = setup.is_bullish ? label.style_label_up : label.style_label_down
+                        bin.labels.push(label.new(ez_lbl_x, ez_lbl_y, "C3", xloc = xloc.bar_time,
+                            color = color_transparent, textcolor = settings.c2_color, style = lbl_style_ez, size = settings.c2_size))
                 
                 // ==== LAYER 9: ENTRY ZONE C4 — zone removed if invalidated; label becomes xC4 ====
                 // Zone right edge develops with LTF bars, then locks at C4 end
@@ -2204,13 +2259,14 @@ method DrawSetups(CandleSet candleSet) =>
                     if not setup.ez_c4_invalid
                         bin.boxes.push(box.new(setup.ez_c4_left_time, setup.ez_c4_top, ez4_right, setup.ez_c4_bot,
                             xloc = xloc.bar_time, bgcolor = ez4_col, border_color = color_transparent, border_width = 0))
-                    float ez4_lbl_y = setup.is_bullish ? setup.ez_c4_bot : setup.ez_c4_top
-                    int ez4_lbl_x = setup.ez_c4_left_time + timeframe.in_seconds() * 1000
-                    string ez4_txt = setup.ez_c4_invalid ? "xC4" : "C4"
-                    color ez4_lbl_col = setup.ez_c4_invalid ? color.red : settings.c2_color
-                    lbl_style_ez4 = setup.is_bullish ? label.style_label_up : label.style_label_down
-                    bin.labels.push(label.new(ez4_lbl_x, ez4_lbl_y, ez4_txt, xloc = xloc.bar_time,
-                        color = color_transparent, textcolor = ez4_lbl_col, style = lbl_style_ez4, size = settings.c2_size))
+                    if settings.show_c4_lbl
+                        float ez4_lbl_y = setup.is_bullish ? setup.ez_c4_bot : setup.ez_c4_top
+                        int ez4_lbl_x = setup.ez_c4_left_time + timeframe.in_seconds() * 1000
+                        string ez4_txt = setup.ez_c4_invalid ? "xC4" : "C4"
+                        color ez4_lbl_col = setup.ez_c4_invalid ? color.red : settings.c2_color
+                        lbl_style_ez4 = setup.is_bullish ? label.style_label_up : label.style_label_down
+                        bin.labels.push(label.new(ez4_lbl_x, ez4_lbl_y, ez4_txt, xloc = xloc.bar_time,
+                            color = color_transparent, textcolor = ez4_lbl_col, style = lbl_style_ez4, size = settings.c2_size))
     
     // Draw live setups (both bullish and bearish)
     for is_bull in array.from(false, true)
@@ -2219,11 +2275,16 @@ method DrawSetups(CandleSet candleSet) =>
         if not bias_ok
             continue
         bool has_live = is_bull ? candleSet.has_live_bullish : candleSet.has_live_bearish
-        if not (settings.sweep_live and has_live)
+        if not has_live
             continue
         setup = is_bull ? candleSet.live_bullish : candleSet.live_bearish
-        if not (setup.is_confirmed or setup.is_post_c2)
-            continue
+        // Live on: developing C2 (sweep back in or post-C2). Live off: only after C2 close + CISD printed.
+        if settings.sweep_live
+            if not (setup.is_confirmed or setup.is_post_c2)
+                continue
+        else
+            if not (setup.is_post_c2 and setup.cisd_triggered)
+                continue
             
         // ==== LAYER 1: LIQUIDITY LINES (behind) - SKIP if invalid ====
         if not setup.is_invalid and settings.liq_show and setup.cisd_triggered and not na(setup.liq_c1_price)
@@ -2264,8 +2325,8 @@ method DrawSetups(CandleSet candleSet) =>
                         color = color_transparent, textcolor = settings.proj_color, 
                         style = label.style_label_right, size = proj_label_sz))
         
-        // ==== LAYER 3: C2 LABEL - show "xC2" in red if invalid ====
-        if setup.is_confirmed or setup.cisd_triggered
+        // ==== LAYER 3: C2 LABEL — only after C2 close + CISD (confirmed setup, not developing live) ====
+        if settings.show_c2_lbl and setup.is_post_c2 and setup.cisd_triggered
             lbl_style = is_bull ? label.style_label_up : label.style_label_down
             string lbl_text = setup.is_invalid ? "xC2" : "C2"
             color lbl_color = setup.is_invalid ? color.red : settings.c2_color
@@ -2295,16 +2356,16 @@ method DrawSetups(CandleSet candleSet) =>
             cisd_color = is_bull ? settings.cisd_bull_color : settings.cisd_bear_color
             bin.lines.push(line.new(setup.cisd_start_idx, setup.cisd_level, setup.cisd_end_idx + 1, setup.cisd_level, color = cisd_color, style = cisd_line_style, width = settings.cisd_width))
         
-        // ==== LAYER 5b: IC-CISD (confirmed only, live) ====
-        if settings.ic_cisd_show and not na(setup.ic_list) and setup.ic_list.size() > 0
-            color ic_col_l = is_bull ? settings.cisd_bull_color : settings.cisd_bear_color
+        // ==== LAYER 5b: IC-CISD (draw only after sweep-back-in / show, live) ====
+        if settings.ic_cisd_show and setup.cisd_triggered and not na(setup.ic_list) and setup.ic_list.size() > 0
             for ic_j = 0 to setup.ic_list.size() - 1
                 ICCisd ic_l = setup.ic_list.get(ic_j)
+                color ic_col_l = ic_l.taken ? color.gray : (is_bull ? settings.cisd_bull_color : settings.cisd_bear_color)
                 if not na(ic_l.level) and not na(ic_l.start_idx) and not na(ic_l.end_idx)
                     bin.lines.push(line.new(ic_l.start_idx, ic_l.level, ic_l.end_idx, ic_l.level, color = ic_col_l, style = cisd_line_style, width = settings.cisd_width))
                 if not na(ic_l.extreme_price) and not na(ic_l.extreme_idx)
                     ic_dot_style_l = is_bull ? label.style_label_up : label.style_label_down
-                    bin.labels.push(label.new(ic_l.extreme_idx, ic_l.extreme_price, "●", color = color_transparent, textcolor = ic_col_l, style = ic_dot_style_l, size = size.tiny))
+                    bin.labels.push(label.new(ic_l.extreme_idx, ic_l.extreme_price, "●", color = color_transparent, textcolor = ic_col_l, style = ic_dot_style_l, size = settings.ic_dot_size))
         
         // ==== LAYER 6: SMT LINE - SKIP if invalid ====
         if not setup.is_invalid and smt_show_input and setup.has_smt and not na(setup.smt_x1) and not na(setup.smt_x2)
@@ -2368,12 +2429,13 @@ method DrawSetups(CandleSet candleSet) =>
             int ez_right_live = EntryZoneRight(setup.ez_c3_right_time)
             bin.boxes.push(box.new(setup.ez_c3_left_time, setup.ez_c3_top, ez_right_live, setup.ez_c3_bot,
                 xloc = xloc.bar_time, bgcolor = ez_col_live, border_color = color_transparent, border_width = 0))
-            float ez_lbl_y_live = is_bull ? setup.ez_c3_bot : setup.ez_c3_top
-            // One chart candle right of box left edge (same rule for C4 later)
-            int ez_lbl_x_live = setup.ez_c3_left_time + timeframe.in_seconds() * 1000
-            lbl_style_ez_live = is_bull ? label.style_label_up : label.style_label_down
-            bin.labels.push(label.new(ez_lbl_x_live, ez_lbl_y_live, "C3", xloc = xloc.bar_time,
-                color = color_transparent, textcolor = settings.c2_color, style = lbl_style_ez_live, size = settings.c2_size))
+            if settings.show_c3_lbl
+                float ez_lbl_y_live = is_bull ? setup.ez_c3_bot : setup.ez_c3_top
+                // One chart candle right of box left edge (same rule for C4 later)
+                int ez_lbl_x_live = setup.ez_c3_left_time + timeframe.in_seconds() * 1000
+                lbl_style_ez_live = is_bull ? label.style_label_up : label.style_label_down
+                bin.labels.push(label.new(ez_lbl_x_live, ez_lbl_y_live, "C3", xloc = xloc.bar_time,
+                    color = color_transparent, textcolor = settings.c2_color, style = lbl_style_ez_live, size = settings.c2_size))
         
     candleSet
 
