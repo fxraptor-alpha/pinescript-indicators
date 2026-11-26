@@ -1,3 +1,5 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Copyright (c) 2026 fxraptor-alpha. Attribution notices are governed by the license in this repository.
 //@version=6
 import fstarcapital/AssetCorrelationUtils/13 as ACL
 indicator('Fractal Model', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
